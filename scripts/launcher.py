@@ -128,6 +128,7 @@ from src.scenarios import (
     _branch_to_dict,
 )
 from src.action_panel import ActionPanel
+from src.walkthrough import Walkthrough
 from src.data_panel import DataPanel
 from src.note_log import NoteLogEntry, resolve_student_id
 from src.browser_worker import BrowserWorker
@@ -8185,6 +8186,11 @@ class App:
             # caseload first" step that warranted hiding it.
             self.root.after(0, self._apply_first_run_geometry)
             self.root.after(400, self._show_first_run_setup)
+
+        # QA/dev hook: force-start the walkthrough on launch (so it can be
+        # exercised without resetting first-run state). Harmless when unset.
+        if os.environ.get("CASELOAD_AUTOTOUR") == "1":
+            self.root.after(1500, self._start_walkthrough)
 
         # Once the worker has the browser open, auto-refresh the
         # caseload CSV in the background so the first batch fire is
@@ -18933,6 +18939,42 @@ class App:
 
         dialog.bind("<Escape>", lambda _e: dialog.destroy())
 
+    def _start_walkthrough(self) -> None:
+        """Launch the interactive first-run walkthrough (opt-in). Safe to call
+        repeatedly — it rebuilds fresh each time. Reachable from the first-run
+        offer and the ❔ Help dialog."""
+        try:
+            wt = getattr(self, "_walkthrough", None)
+            if wt is None or not getattr(wt, "_active", False):
+                self._walkthrough = Walkthrough(self)
+            self._walkthrough.start()
+        except Exception as e:
+            self._append_log(f"Couldn't start the walkthrough: {e}", error=True)
+
+    def _offer_walkthrough(self) -> None:
+        """After first-run setup, ask once whether to take the guided tour.
+        Declining (or having seen it) sets walkthrough_done so it's not
+        re-offered — it stays available from ❔ Help."""
+        if getattr(self.settings, "walkthrough_done", False):
+            return
+        try:
+            take = ask_yes_no_topmost(
+                self.root, "Take a quick tour?",
+                "New here? A two-minute walkthrough shows where things are and "
+                "how to file your first note.\n\nYou can skip it and start "
+                "right away — it's always available from ❔ Help.",
+                yes_label="Show me around", no_label="I'll explore")
+        except Exception:
+            take = False
+        if take:
+            self._start_walkthrough()
+        else:
+            self.settings.walkthrough_done = True
+            try:
+                save_settings(self.settings)
+            except Exception:
+                pass
+
     def _show_help(self) -> None:
         """Getting-started / What-can-this-do dialog (❔ Help button). A calm
         landing point for new users: the first three steps to a first action,
@@ -18990,7 +19032,21 @@ class App:
              "once. Here's how to start, and everything it can do."),
             14, text_color=("gray35", "gray70"),
             wraplength=620, justify="left", anchor="w",
-            ).pack(fill="x", padx=20, pady=(0, 10))
+            ).pack(fill="x", padx=20, pady=(0, 8))
+
+        # Prominent launcher for the interactive tour (closes Help first so the
+        # spotlight isn't hidden behind this modal).
+        def _launch_tour() -> None:
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+            self.root.after(150, self._start_walkthrough)
+        ctk.CTkButton(
+            dialog, text="▶  Take the interactive walkthrough",
+            height=36, font=ctk.CTkFont(size=13, weight="bold"),
+            command=_launch_tour,
+        ).pack(fill="x", padx=20, pady=(0, 10))
 
         body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=12, pady=(0, 4))
@@ -19241,6 +19297,8 @@ class App:
             except Exception: pass
             try: dialog.destroy()
             except Exception: pass
+            # Offer the guided tour once the welcome dialog is out of the way.
+            self.root.after(250, self._offer_walkthrough)
 
         btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
         btn_row.pack(fill="x", padx=20, pady=(0, 18), side="bottom")

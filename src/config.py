@@ -380,6 +380,10 @@ class Settings:
     # default (Ungrouped pinned). And the selected group tab among the unpinned.
     action_pinned_groups: str = ""
     action_active_tab: str = ""
+    # Interactive first-run walkthrough (src/walkthrough.py): True once the user
+    # has finished or dismissed it, so it's offered only once (still relaunchable
+    # from ❔ Help).
+    walkthrough_done: bool = False
     # Warn (red activity-log line) before a batch/selection fire when the
     # cached caseload CSV is older than this many MINUTES. 0 = never warn.
     caseload_stale_minutes: int = 720  # 12 h
