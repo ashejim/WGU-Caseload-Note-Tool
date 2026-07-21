@@ -66,24 +66,44 @@ def test_skip_finishes_and_sets_flag():
     assert wt.app.settings.walkthrough_done is True
 
 
-def test_fire_step_present_only_with_test_group():
-    # With a Test group, the hands-on "fire a safe action" DO step is included.
+def _fire_titles(steps):
+    return [s for s in steps if "fire a safe" in s["title"].lower()]
+
+
+def test_fire_step_prefers_bundled_walkthrough_action():
+    # When the bundled safe action ships, the fire step targets it by name.
+    from src.walkthrough import WALKTHROUGH_ACTION
     app = SimpleNamespace(
         root=MagicMock(), settings=SimpleNamespace(walkthrough_done=False),
-        groups=[SimpleNamespace(name="\U0001f9ea Test")])
+        scenarios={WALKTHROUGH_ACTION: object()},
+        groups=[SimpleNamespace(name="Samples",
+                                scenarios=[WALKTHROUGH_ACTION])])
     wt = Walkthrough(app)
+    assert wt._fire_target() == ("Samples", WALKTHROUGH_ACTION)
     steps = wt._build_steps()
-    fire = [s for s in steps if "fire a safe" in s["title"].lower()]
-    assert len(fire) == 1
-    assert fire[0]["kind"] == "do"
-    assert wt._test_group_name() == "\U0001f9ea Test"
-    # Without one, the step is omitted (no crash, shorter path).
-    app2 = SimpleNamespace(
+    fire = _fire_titles(steps)
+    assert len(fire) == 1 and fire[0]["kind"] == "do"
+    assert WALKTHROUGH_ACTION in fire[0]["body"]
+
+
+def test_fire_step_falls_back_to_test_group():
+    # No bundled action, but a user 'Test' group → still offered (by group).
+    app = SimpleNamespace(
         root=MagicMock(), settings=SimpleNamespace(walkthrough_done=False),
-        groups=[])
-    steps2 = Walkthrough(app2)._build_steps()
-    assert not any("fire a safe" in s["title"].lower() for s in steps2)
-    assert len(steps2) == len(steps) - 1
+        scenarios={}, groups=[SimpleNamespace(name="\U0001f9ea Test",
+                                              scenarios=[])])
+    wt = Walkthrough(app)
+    assert wt._fire_target() == ("\U0001f9ea Test", "")
+    assert len(_fire_titles(wt._build_steps())) == 1
+
+
+def test_fire_step_omitted_without_target():
+    app = SimpleNamespace(
+        root=MagicMock(), settings=SimpleNamespace(walkthrough_done=False),
+        scenarios={}, groups=[])
+    wt = Walkthrough(app)
+    assert wt._fire_target() == (None, "")
+    assert _fire_titles(wt._build_steps()) == []
 
 
 def test_start_is_idempotent_while_active():

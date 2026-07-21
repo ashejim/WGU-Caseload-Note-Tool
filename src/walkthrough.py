@@ -26,6 +26,10 @@ import customtkinter as ctk
 
 from src.config import save_settings
 
+# The bundled safe action the walkthrough's guided-fire step points at (ships in
+# default_scenarios.yaml). Falls back to any 'test'-named group if absent.
+WALKTHROUGH_ACTION = "Try me - file a test note"
+
 _ACCENT = "#4a9eff"
 _BUBBLE_W = 460
 
@@ -334,37 +338,57 @@ class Walkthrough:
             pass
 
     # ----------------------------------------------------------------- steps
-    def _test_group_name(self) -> str:
-        """Name of the bundled sample 'Test' group (safe-to-fire actions), or ''
-        if the user has removed it — matched loosely so a 🧪 prefix is fine."""
-        for g in getattr(self.app, "groups", None) or []:
+    def _fire_target(self):
+        """(group_name, action_name) for the guided fire step, or (None, '').
+        Prefers the bundled safe walkthrough action; falls back to any
+        'test'-named group so a user's own Test group still works."""
+        app = self.app
+        scenarios = getattr(app, "scenarios", None) or {}
+        groups = getattr(app, "groups", None) or []
+        if WALKTHROUGH_ACTION in scenarios:
+            for g in groups:
+                if WALKTHROUGH_ACTION in (getattr(g, "scenarios", None) or []):
+                    return g.name, WALKTHROUGH_ACTION
+            return "", WALKTHROUGH_ACTION      # present but ungrouped
+        for g in groups:
             if "test" in (g.name or "").lower():
-                return g.name
-        return ""
+                return g.name, ""
+        return None, ""
 
-    def _reveal_test_group(self) -> None:
-        name = self._test_group_name()
+    def _reveal_fire_group(self) -> None:
+        group, _ = self._fire_target()
         panel = getattr(self.app, "action_panel", None)
-        if name and panel is not None:
+        if group and panel is not None:
             try:
-                panel.reveal_group(name)
+                panel.reveal_group(group)
             except Exception:
                 pass
 
     def _build_steps(self) -> list:
         app = self.app
-        has_test = bool(self._test_group_name())
+        group, action = self._fire_target()
+        has_fire = bool(group) or bool(action)
+        if action:
+            fire_body = (
+                f"Click a student in the caseload to select them, then click "
+                f"“{action}”. It's safe: no email or text — it just opens a note "
+                f"for you to review, and nothing is filed until you press Submit "
+                f"yourself. Click Continue when you've tried it — or skip and do "
+                f"it whenever.")
+            fire_label = f"Show me “{action}”"
+        else:
+            fire_body = (
+                "Click a student in the caseload to select them, then click an "
+                "action in your Test group — these are safe to fire. Anything "
+                "that emails or texts shows a review first, so nothing goes out "
+                "without your OK. Click Continue when you've tried one — or skip.")
+            fire_label = "Show the Test actions"
         fire_step = {
             "kind": "do", "target": None,
-            "title": "Try it: fire a safe test action",
-            "body": "Click a student in the caseload to select them, then click "
-                    "an action in the 🧪 Test group — these are safe to fire. "
-                    "Anything that emails or texts shows you a review first, so "
-                    "nothing goes out without your OK. (A filed note can be "
-                    "edited afterward.) Click Continue when you've tried one — "
-                    "or skip and do it whenever.",
-            "action_label": "🧪 Show the Test actions",
-            "action": self._reveal_test_group,
+            "title": "Try it: fire a safe action",
+            "body": fire_body,
+            "action_label": fire_label,
+            "action": self._reveal_fire_group,
         }
         steps = [
             {"kind": "narrate", "target": None,
@@ -409,8 +433,8 @@ class Walkthrough:
                      "edited afterward if needed."},
         ]
         # Optional hands-on finale: fire a safe sample action. Only offered when
-        # the bundled Test group is present (skip cleanly if the user removed it).
-        if has_test:
+        # there's a safe target to point at (skip cleanly otherwise).
+        if has_fire:
             steps.append(fire_step)
         steps.append(
             {"kind": "narrate", "target": None,

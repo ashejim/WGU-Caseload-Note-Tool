@@ -4,6 +4,25 @@
 # Batch samples ship with preview ON, so nothing sends until you review it.
 scenarios:
 
+  # WALKTHROUGH — a totally safe first fire. Files a plain internal "Admin Note"
+  # (no email, no text), and submit is OFF, so it just fills the note form for
+  # you to review and submit — or cancel. Nothing sends, and nothing is filed
+  # until you click Submit yourself. The interactive walkthrough (❔ Help) points
+  # here; edit or delete it once you're comfortable.
+  Try me - file a test note:
+    hotkey: ''
+    close_tab_after: false
+    find_first: false
+    panel_action: true
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Admin Note
+      body: Test note from the Caseload Notes walkthrough - safe to submit or cancel.
+      academic_activities: []
+      submit: false
+      append_clipboard: false
+      enter_additional_text: false
+
   # SINGLE-FIRE: press F3 with a student's note panel open in Salesforce to
   # fill a note. It uses the "Student note" TEMPLATE below (note_template) — a
   # fill-in form you tab through at fire time; the result becomes the note body.
@@ -122,6 +141,7 @@ groups:
 - name: Sample single actions (edit or delete me)
   color: '#2f75c9'
   scenarios:
+  - Try me - file a test note
   - Sample - quick note
   - Sample - follow-up email
 - name: Sample batch actions (edit or delete me)
