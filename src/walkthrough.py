@@ -334,9 +334,39 @@ class Walkthrough:
             pass
 
     # ----------------------------------------------------------------- steps
+    def _test_group_name(self) -> str:
+        """Name of the bundled sample 'Test' group (safe-to-fire actions), or ''
+        if the user has removed it — matched loosely so a 🧪 prefix is fine."""
+        for g in getattr(self.app, "groups", None) or []:
+            if "test" in (g.name or "").lower():
+                return g.name
+        return ""
+
+    def _reveal_test_group(self) -> None:
+        name = self._test_group_name()
+        panel = getattr(self.app, "action_panel", None)
+        if name and panel is not None:
+            try:
+                panel.reveal_group(name)
+            except Exception:
+                pass
+
     def _build_steps(self) -> list:
         app = self.app
-        return [
+        has_test = bool(self._test_group_name())
+        fire_step = {
+            "kind": "do", "target": None,
+            "title": "Try it: fire a safe test action",
+            "body": "Click a student in the caseload to select them, then click "
+                    "an action in the 🧪 Test group — these are safe to fire. "
+                    "Anything that emails or texts shows you a review first, so "
+                    "nothing goes out without your OK. (A filed note can be "
+                    "edited afterward.) Click Continue when you've tried one — "
+                    "or skip and do it whenever.",
+            "action_label": "🧪 Show the Test actions",
+            "action": self._reveal_test_group,
+        }
+        steps = [
             {"kind": "narrate", "target": None,
              "title": "Welcome — let's take two minutes",
              "body": "A quick tour of where things are and how to file your "
@@ -377,9 +407,15 @@ class Walkthrough:
                      "emails or texts always shows you a review first, so "
                      "nothing goes out without your OK. A filed note can be "
                      "edited afterward if needed."},
-            {"kind": "narrate", "target": None,
-             "title": "You're set — try a real one when ready",
-             "body": "Whenever you like: pick a student, then fire a 🧪 Test "
-                     "action to see the full flow safely. Reopen this tour "
-                     "anytime from ❔ Help. Happy filing!"},
         ]
+        # Optional hands-on finale: fire a safe sample action. Only offered when
+        # the bundled Test group is present (skip cleanly if the user removed it).
+        if has_test:
+            steps.append(fire_step)
+        steps.append(
+            {"kind": "narrate", "target": None,
+             "title": "You're all set",
+             "body": "That's the whole loop: pick a student, fire an action, "
+                     "review, done. Reopen this tour anytime from ❔ Help — "
+                     "happy filing!"})
+        return steps

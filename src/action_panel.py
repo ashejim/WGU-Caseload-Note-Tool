@@ -367,6 +367,22 @@ class ActionPanel:
         self._save_state()
         self.rebuild()
 
+    def reveal_group(self, name: str) -> bool:
+        """Make the group `name` visible: select its tab if it's a tab, or
+        expand it if it's pinned. Returns True if the group exists. Used by the
+        walkthrough to surface the sample Test actions."""
+        if self._pinned is None:
+            self._load_state()
+        if not any(g.name == name for g in self.app.groups):
+            return False
+        if name in (self._pinned or set()):
+            self._collapsed[name] = False       # pinned box → expand
+        else:
+            self._active_tab = name             # tab → select it
+            self._save_state()
+        self.rebuild()
+        return True
+
     def _reapply_queue_affordance(self) -> None:
         # Keep the queue-add highlight consistent after any rebuild (e.g. a tab
         # switch while in add-mode rebuilds the buttons).
