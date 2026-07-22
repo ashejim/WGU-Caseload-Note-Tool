@@ -8188,9 +8188,10 @@ class App:
             self.root.after(400, self._show_first_run_setup)
 
         # QA/dev hook: force-start the walkthrough on launch (so it can be
-        # exercised without resetting first-run state). Harmless when unset.
+        # exercised without resetting first-run state). Deferred until startup
+        # finishes (see _close_splash), same as the real offer. Harmless unset.
         if os.environ.get("CASELOAD_AUTOTOUR") == "1":
-            self.root.after(1500, self._start_walkthrough)
+            self._autotour_pending = True
 
         # Once the worker has the browser open, auto-refresh the
         # caseload CSV in the background so the first batch fire is
@@ -9021,11 +9022,20 @@ class App:
         # below before any button can be clicked — closures by ref.)
         btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
         btn_row.pack(fill="x", padx=20, pady=(4, 16), side="bottom")
+        # Inline validation message (packed above the buttons). Shown IN the
+        # dialog — the activity log is hidden behind the editor/dialog, so a
+        # log-only warning left Save looking like it silently did nothing.
+        warn_var = ctk.StringVar(value="")
+        ctk.CTkLabel(
+            dialog, textvariable=warn_var, anchor="w", justify="left",
+            wraplength=460, text_color=("#c0392b", "#ff6b6b"),
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(fill="x", padx=20, pady=(0, 0), side="bottom")
 
         def _do_save() -> None:
             new_name = (name_entry.get() or "").strip()
             if not new_name:
-                self._append_log("Group save aborted: name is required.")
+                warn_var.set("Please enter a name for the group.")
                 return
             new_short = (short_name_entry.get() or "").strip()
             # Reject duplicate names (except when editing the same one).
@@ -9033,9 +9043,8 @@ class App:
                 if g is group:
                     continue
                 if g.name.lower() == new_name.lower():
-                    self._append_log(
-                        f"Group save aborted: name {new_name!r} already exists."
-                    )
+                    warn_var.set(f"A group named “{new_name}” already exists — "
+                                 "pick a different name.")
                     return
             picked = [n for n, v in scenario_vars.items() if v.get()]
             # Unparent any newly-checked scenario from its current group.
@@ -11659,6 +11668,9 @@ class App:
 
     def _fire(self, scenario: ScenarioConfig, *,
               from_hotkey: bool = False) -> None:
+        # Record which action the user just chose (for the walkthrough's
+        # "fire an action" checklist item — harmless otherwise).
+        self._last_fired_action = scenario.name
         # A batch selection is armed (the viewer is showing a batch's matched
         # students with a Start/Cancel bar) — finish that before anything else.
         if getattr(self, "_armed_batch", None) is not None:
@@ -12547,10 +12559,17 @@ class App:
             self._append_log(
                 f"Filing {len(scenario.notes)} note(s) for "
                 f"{chosen_name or prenav_label or 'student'}…")
+            # The fire-time pop-up (if any) is done; we're now filling the note
+            # in Salesforce. Record it for the walkthrough's "reviewed the
+            # pop-up" checklist item (harmless otherwise).
+            self._note_fill_started = scenario.name
             self.worker.submit_scenario(
                 scenario, note_override, clipboard,
                 custom_bodies=custom_bodies,
                 prompt_vars=prompt_vars, ea=ea_arg,
+                # Single-student fire: if the note is left for review (submit
+                # off), surface the browser so the user sees the filled form.
+                raise_on_review=True,
             )
 
     def _fire_record_only(self, scenario: ScenarioConfig, student_id: str,
@@ -15025,6 +15044,10 @@ class App:
                 if self._submit_scenario_blocking(
                     scenario, row_override, clipboard, custom_bodies,
                     prompt_vars=prompt_vars,
+                    # Firing on ONE student → surface the browser if the note is
+                    # left for review (submit off); don't pop it per-student in a
+                    # real batch.
+                    raise_on_review=(total == 1),
                 ):
                     processed += 1
                 else:
@@ -15103,6 +15126,7 @@ class App:
         rows (the panel's checkbox selection) — a mini-batch. Reuses the
         batch execution core, including the FERPA per-student email-review
         modal when the scenario has an email step."""
+        self._last_fired_action = scenario.name   # walkthrough checklist hook
         if getattr(self, "_armed_batch", None) is not None:
             self._append_log(
                 "Finish the current batch selection first — click ✓ Start or "
@@ -16492,6 +16516,7 @@ class App:
         self, scenario: ScenarioConfig, override: str,
         clipboard: str, custom_bodies: dict[int, str],
         prompt_vars: Optional[dict[str, str]] = None,
+        raise_on_review: bool = False,
     ) -> bool:
         """Queue a scenario RUN and block until the worker reports
         completion. Returns True iff the run completed without
@@ -16515,6 +16540,7 @@ class App:
             custom_bodies=custom_bodies,
             prompt_vars=prompt_vars,
             on_done=on_done,
+            raise_on_review=raise_on_review,
         )
         with self._waiting("Salesforce", "filing the note"):
             self.root.wait_variable(done_var)
@@ -18939,17 +18965,164 @@ class App:
 
         dialog.bind("<Escape>", lambda _e: dialog.destroy())
 
-    def _start_walkthrough(self) -> None:
-        """Launch the interactive first-run walkthrough (opt-in). Safe to call
-        repeatedly — it rebuilds fresh each time. Reachable from the first-run
-        offer and the ❔ Help dialog."""
+    def _start_walkthrough(self, tour: str = "note") -> None:
+        """Launch an interactive walkthrough (opt-in). `tour` is "note" (the
+        golden path) or "batch" (welcome-email batch). Safe to call repeatedly —
+        it rebuilds fresh. Reachable from the first-run offer, the note tour's
+        finale, and the ❔ Help dialog."""
         try:
             wt = getattr(self, "_walkthrough", None)
-            if wt is None or not getattr(wt, "_active", False):
-                self._walkthrough = Walkthrough(self)
+            if (wt is None or not getattr(wt, "_active", False)
+                    or getattr(wt, "tour", "note") != tour):
+                self._walkthrough = Walkthrough(self, tour=tour)
             self._walkthrough.start()
         except Exception as e:
             self._append_log(f"Couldn't start the walkthrough: {e}", error=True)
+
+    def _open_editor(self, select_action: str = "") -> None:
+        """Open the action-editor pane if it isn't already, and optionally jump
+        straight to `select_action`'s editor (the batch walkthrough opens right
+        on its action so the user just adds a filter)."""
+        if not getattr(self, "_editor_visible", False):
+            try:
+                self._toggle_editor()
+            except Exception:
+                pass
+        if select_action and select_action in getattr(self, "scenarios", {}):
+            try:
+                self._select_editor_scenario(select_action)
+            except Exception:
+                pass
+
+    def _on_walkthrough_ended(self) -> None:
+        """Called when a walkthrough fully finishes (not between phases). Offers
+        at-rest encryption, which was deferred from startup so it follows the
+        tour instead of preceding it."""
+        try:
+            self.root.after(300, self._offer_encryption_setup)
+        except Exception:
+            self._offer_encryption_setup()
+
+    def _offer_encryption_setup(self) -> None:
+        """Offer to encrypt the local data files (deferred from startup). Runs
+        the setup mid-session — safe, because migrate_existing keeps the
+        plaintext working files for this session and only adds .enc copies.
+        Idempotent: fires at most once."""
+        if not getattr(self, "_encryption_pending", False):
+            return
+        self._encryption_pending = False
+        pending = getattr(self, "_pending_vault", None)
+        self._pending_vault = None
+        if not pending:
+            return
+        vault, managed, allow_remember = pending
+        pw = self._ask_encryption_password()
+        self.settings.encryption_offer_seen = True
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
+        if pw is None:
+            self._append_log(
+                "Encryption not enabled — your local data stays unencrypted. "
+                "You can enable it later in ⚙ Settings.")
+            return
+        try:
+            vault.setup(pw)
+            errs = managed.migrate_existing()
+            if allow_remember:
+                vault.remember_on_this_machine()
+            self._vault, self._managed = vault, managed
+            if errs:
+                self._append_log(
+                    "Encryption enabled (with warnings): " + "; ".join(errs),
+                    error=True)
+            else:
+                self._append_log(
+                    "✓ Local data encryption enabled. Don't forget your "
+                    "password — there's no recovery.", success=True)
+        except Exception as e:
+            self._append_log(f"Couldn't enable encryption: {e}", error=True)
+
+    def _ask_encryption_password(self) -> Optional[str]:
+        """Modal password-setup dialog (a Toplevel of the running app — unlike
+        the startup _vault_setup_prompt which makes its own root). Returns the
+        chosen password, or None if declined. Requires matching, ≥4-char entries.
+        """
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Protect your local data")
+        dialog.transient(self.root)
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        dialog.lift()
+        dialog.focus_force()
+        result = {"pw": None}
+
+        ctk.CTkLabel(
+            dialog, text="Encrypt your local data? (optional)",
+            font=ctk.CTkFont(size=16, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=24, pady=(20, 4))
+        ctk.CTkLabel(
+            dialog, justify="left", wraplength=460, anchor="w",
+            text=("Over-the-top safe: this tool keeps the caseload, history, "
+                  "notes, and success-path data on THIS computer only — nothing "
+                  "is ever uploaded. Setting an app password encrypts those "
+                  "files at rest, so they're unreadable if the computer is lost "
+                  "or the files are copied off it. You'll enter it to unlock the "
+                  "app.\n\n"
+                  "⚠  There is NO recovery if you forget it — store it safely."),
+            font=ctk.CTkFont(size=12), text_color=("gray25", "gray80"),
+        ).pack(fill="x", padx=24, pady=(0, 12))
+
+        e1 = ctk.CTkEntry(dialog, show="•", width=300,
+                          placeholder_text="App password")
+        e1.pack(padx=24, pady=3, anchor="w")
+        e2 = ctk.CTkEntry(dialog, show="•", width=300,
+                          placeholder_text="Confirm password")
+        e2.pack(padx=24, pady=3, anchor="w")
+        msg = ctk.CTkLabel(dialog, text="", text_color=("#c0392b", "#ff6b6b"),
+                           anchor="w")
+        msg.pack(fill="x", padx=24, pady=(4, 0))
+        e1.focus_set()
+
+        def _enable(*_a):
+            p1, p2 = e1.get(), e2.get()
+            if not p1:
+                msg.configure(text="Enter a password (or click Not now).")
+                return
+            if p1 != p2:
+                msg.configure(text="Passwords don't match.")
+                return
+            if len(p1) < 4:
+                msg.configure(text="Use at least 4 characters.")
+                return
+            result["pw"] = p1
+            _close()
+
+        def _decline(*_a):
+            result["pw"] = None
+            _close()
+
+        def _close():
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+
+        btns = ctk.CTkFrame(dialog, fg_color="transparent")
+        btns.pack(fill="x", padx=24, pady=(14, 20))
+        ctk.CTkButton(
+            btns, text="Not now", width=110, command=_decline,
+            **SECONDARY_BTN_KWARGS).pack(side="left")
+        ctk.CTkButton(
+            btns, text="Enable encryption", width=160, command=_enable,
+        ).pack(side="right")
+        dialog.bind("<Return>", _enable)
+        dialog.bind("<Escape>", _decline)
+        dialog.protocol("WM_DELETE_WINDOW", _decline)
+        self.root.wait_window(dialog)
+        return result["pw"]
 
     def _offer_walkthrough(self) -> None:
         """After first-run setup, ask once whether to take the guided tour.
@@ -18967,13 +19140,16 @@ class App:
         except Exception:
             take = False
         if take:
-            self._start_walkthrough()
+            self._start_walkthrough()   # its end offers encryption
         else:
             self.settings.walkthrough_done = True
             try:
                 save_settings(self.settings)
             except Exception:
                 pass
+            # Declined the tour → still offer at-rest encryption (it was
+            # deferred from startup so it'd follow the tour).
+            self._offer_encryption_setup()
 
     def _show_help(self) -> None:
         """Getting-started / What-can-this-do dialog (❔ Help button). A calm
@@ -19034,19 +19210,26 @@ class App:
             wraplength=620, justify="left", anchor="w",
             ).pack(fill="x", padx=20, pady=(0, 8))
 
-        # Prominent launcher for the interactive tour (closes Help first so the
+        # Prominent launchers for the interactive tours (close Help first so the
         # spotlight isn't hidden behind this modal).
-        def _launch_tour() -> None:
+        def _launch_tour(tour: str) -> None:
             try: dialog.grab_release()
             except Exception: pass
             try: dialog.destroy()
             except Exception: pass
-            self.root.after(150, self._start_walkthrough)
+            self.root.after(150, lambda: self._start_walkthrough(tour))
+        tour_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        tour_row.pack(fill="x", padx=20, pady=(0, 10))
         ctk.CTkButton(
-            dialog, text="▶  Take the interactive walkthrough",
+            tour_row, text="▶  Walkthrough: file a note",
             height=36, font=ctk.CTkFont(size=13, weight="bold"),
-            command=_launch_tour,
-        ).pack(fill="x", padx=20, pady=(0, 10))
+            command=lambda: _launch_tour("note"),
+        ).pack(side="left", expand=True, fill="x", padx=(0, 4))
+        ctk.CTkButton(
+            tour_row, text="▶  Walkthrough: batch welcome email",
+            height=36, font=ctk.CTkFont(size=13, weight="bold"),
+            command=lambda: _launch_tour("batch"),
+        ).pack(side="left", expand=True, fill="x", padx=(4, 0))
 
         body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=12, pady=(0, 4))
@@ -19297,8 +19480,13 @@ class App:
             except Exception: pass
             try: dialog.destroy()
             except Exception: pass
-            # Offer the guided tour once the welcome dialog is out of the way.
-            self.root.after(250, self._offer_walkthrough)
+            # Offer the guided tour — but only once startup has finished (splash
+            # down, caseload loaded), so it never pops over the splash or mid-
+            # load. If startup already finished (user lingered here), offer now.
+            if getattr(self, "_startup_ui_settled", False):
+                self.root.after(400, self._offer_walkthrough)
+            else:
+                self._walkthrough_pending = True
 
         btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
         btn_row.pack(fill="x", padx=20, pady=(0, 18), side="bottom")
@@ -21139,24 +21327,17 @@ class App:
                 print("Decrypt issues: " + "; ".join(errs), file=sys.stderr)
             return
 
-        # Not set up. Offer encryption ONCE; don't nag a user who declined.
+        # Not set up. DEFER the encryption offer until after the walkthrough — a
+        # bare password dialog before the app even appears is jarring, and the
+        # walkthrough explains what encryption does first. _offer_encryption_setup
+        # (called at the end of the tour, or after startup if no tour runs) does
+        # the actual mid-session setup: migrate_existing leaves the plaintext
+        # working files in place for the session and only writes encrypted .enc
+        # copies (shredded/re-encrypted on exit), so it's safe to run now.
         if getattr(self.settings, "encryption_offer_seen", False):
             return
-        pw = _vault_setup_prompt()
-        self.settings.encryption_offer_seen = True
-        try:
-            save_settings(self.settings)
-        except Exception:
-            pass
-        if pw is None:
-            return   # declined — run unencrypted (today's behavior)
-        vault.setup(pw)
-        errs = managed.migrate_existing()
-        if allow_remember:
-            vault.remember_on_this_machine()
-        self._vault, self._managed = vault, managed
-        if errs:
-            print("Migration issues: " + "; ".join(errs), file=sys.stderr)
+        self._pending_vault = (vault, managed, allow_remember)
+        self._encryption_pending = True
 
     def _change_vault_password(self, parent=None) -> None:
         """In-session password change: re-key the vault and re-encrypt every
@@ -21563,6 +21744,29 @@ class App:
             except Exception:
                 pass
             self._splash = None
+        # Startup is visually done now (this runs on the normal finish AND the
+        # safety timeout / no-login path). Release any UI that was deferred so it
+        # never popped over the splash or mid-load — namely the walkthrough
+        # offer/tour. Once only.
+        if not getattr(self, "_startup_ui_settled", False):
+            self._startup_ui_settled = True
+            self._run_deferred_startup_ui()
+
+    def _run_deferred_startup_ui(self) -> None:
+        """Fire UI that waited for startup to finish (splash down, caseload
+        loaded), after a short settle so the browser-minimize/Mongoose-open
+        don't visually collide with it."""
+        if getattr(self, "_autotour_pending", False):
+            self._autotour_pending = False
+            self._walkthrough_pending = False
+            self.root.after(800, self._start_walkthrough)
+        elif getattr(self, "_walkthrough_pending", False):
+            self._walkthrough_pending = False
+            self.root.after(800, self._offer_walkthrough)
+        else:
+            # No walkthrough this launch → offer the deferred at-rest encryption
+            # directly (no-op if nothing is pending / already set up).
+            self.root.after(800, self._offer_encryption_setup)
 
     def _splash_step(self, msg: str, frac: Optional[float] = None) -> None:
         """Report a startup step to the splash's status line + progress bar

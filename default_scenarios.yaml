@@ -4,11 +4,12 @@
 # Batch samples ship with preview ON, so nothing sends until you review it.
 scenarios:
 
-  # WALKTHROUGH — a totally safe first fire. Files a plain internal "Admin Note"
-  # (no email, no text), and submit is OFF, so it just fills the note form for
-  # you to review and submit — or cancel. Nothing sends, and nothing is filed
-  # until you click Submit yourself. The interactive walkthrough (❔ Help) points
-  # here; edit or delete it once you're comfortable.
+  # WALKTHROUGH — a totally safe first fire. "Edit at fire time" is ON, so a
+  # pre-filled, EDITABLE note pop-up appears first (you see the note-type/course
+  # controls), then it opens the note form in Salesforce with submit OFF — so the
+  # browser comes forward and leaves it filled for you to review and Submit
+  # yourself. Nothing sends, and nothing files until you click Submit. The
+  # interactive walkthrough (❔ Help) points here; edit or delete it once comfy.
   Try me - file a test note:
     hotkey: ''
     close_tab_after: false
@@ -21,7 +22,39 @@ scenarios:
       academic_activities: []
       submit: false
       append_clipboard: false
+      enter_additional_text: true
+
+  # WALKTHROUGH (BATCH) — the batch tour points here. Emails a welcome to every
+  # student matching its filters and files a note for each. It ships filtered to
+  # students with NO ACI contact yet (Last Assigned CI Contact is empty); the
+  # tour has you ADD a "Course Code is <your course>" filter so it targets one
+  # course. Preview is ON — you review the recipient list AND each email before
+  # anything sends. {{preferred_name}} and {{course_code}} fill per student.
+  Try me - welcome email (batch):
+    hotkey: ''
+    close_tab_after: false
+    find_first: false
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Email to Student
+      body: Sent a welcome email to the newly assigned student.
+      academic_activities: []
+      submit: true
+      append_clipboard: false
       enter_additional_text: false
+    email:
+      subject: Welcome to {{course_code}}, {{preferred_name}}!
+      body_html_file: walkthrough_welcome.html
+      to: ''
+      signature_file: ''
+      inline_images: []
+      cc_pm: false
+    batch:
+      filters:
+      - column: Last Assigned CI Contact
+        op: is empty
+        value: ''
+      preview: true
 
   # SINGLE-FIRE: press F3 with a student's note panel open in Salesforce to
   # fill a note. It uses the "Student note" TEMPLATE below (note_template) — a
@@ -147,6 +180,7 @@ groups:
 - name: Sample batch actions (edit or delete me)
   color: '#2f9e44'
   scenarios:
+  - Try me - welcome email (batch)
   - Sample - welcome (batch)
   - Sample - Task 1 passed (batch)
 

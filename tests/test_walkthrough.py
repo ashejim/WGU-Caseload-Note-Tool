@@ -66,8 +66,8 @@ def test_skip_finishes_and_sets_flag():
     assert wt.app.settings.walkthrough_done is True
 
 
-def _fire_titles(steps):
-    return [s for s in steps if "fire a safe" in s["title"].lower()]
+def _fire_steps(steps):
+    return [s for s in steps if s.get("kind") == "checklist"]
 
 
 def test_fire_step_prefers_bundled_walkthrough_action():
@@ -81,9 +81,18 @@ def test_fire_step_prefers_bundled_walkthrough_action():
     wt = Walkthrough(app)
     assert wt._fire_target() == ("Samples", WALKTHROUGH_ACTION)
     steps = wt._build_steps()
-    fire = _fire_titles(steps)
-    assert len(fire) == 1 and fire[0]["kind"] == "do"
-    assert WALKTHROUGH_ACTION in fire[0]["body"]
+    fire = _fire_steps(steps)
+    assert len(fire) == 1 and fire[0]["kind"] == "checklist"
+    # The action name appears in the intro and the click item.
+    assert WALKTHROUGH_ACTION in fire[0]["intro"]
+    assert any(WALKTHROUGH_ACTION in it.get("text", "")
+               for it in fire[0]["items"])
+    # Four items: the first three auto-check (done() probe); the last is manual
+    # (done None) with a bold emphasis line (emphasis_fn) naming the student.
+    items = fire[0]["items"]
+    assert len(items) == 4
+    assert all(callable(items[i]["done"]) for i in (0, 1, 2))
+    assert items[3]["done"] is None and callable(items[3]["emphasis_fn"])
 
 
 def test_fire_step_falls_back_to_test_group():
@@ -94,7 +103,7 @@ def test_fire_step_falls_back_to_test_group():
                                               scenarios=[])])
     wt = Walkthrough(app)
     assert wt._fire_target() == ("\U0001f9ea Test", "")
-    assert len(_fire_titles(wt._build_steps())) == 1
+    assert len(_fire_steps(wt._build_steps())) == 1
 
 
 def test_fire_step_omitted_without_target():
@@ -103,7 +112,7 @@ def test_fire_step_omitted_without_target():
         scenarios={}, groups=[])
     wt = Walkthrough(app)
     assert wt._fire_target() == (None, "")
-    assert _fire_titles(wt._build_steps()) == []
+    assert _fire_steps(wt._build_steps()) == []
 
 
 def test_start_is_idempotent_while_active():

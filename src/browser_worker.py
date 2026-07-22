@@ -147,6 +147,7 @@ class BrowserWorker:
         prompt_vars: Optional[dict[str, str]] = None,
         on_done: Optional[Callable[[bool], None]] = None,
         ea: Optional[tuple] = None,
+        raise_on_review: bool = False,
     ) -> None:
         """Queue a scenario for the worker to fill notes against the
         active student. `prompt_vars` carries the user-typed values
@@ -161,6 +162,7 @@ class BrowserWorker:
         self.q.put((
             "RUN", scenario, course_code_override, clipboard,
             custom_bodies or {}, prompt_vars or {}, on_done, ea,
+            raise_on_review,
         ))
 
     def submit_read_essential_actions(
@@ -585,12 +587,14 @@ class BrowserWorker:
             (_, scenario, override, clipboard, custom_bodies,
              prompt_vars, on_done) = cmd[:7]
             ea = cmd[7] if len(cmd) > 7 else None
+            raise_on_review = cmd[8] if len(cmd) > 8 else False
             success = False
             try:
                 success = self._handle_run(
                     ctx, scenario, override, clipboard,
                     custom_bodies=custom_bodies,
                     prompt_vars=prompt_vars, ea=ea,
+                    raise_on_review=raise_on_review,
                 )
             finally:
                 if on_done is not None:
@@ -5473,6 +5477,7 @@ class BrowserWorker:
         custom_bodies: Optional[dict[int, str]] = None,
         prompt_vars: Optional[dict[str, str]] = None,
         ea: Optional[tuple] = None,
+        raise_on_review: bool = False,
     ) -> bool:
         """Return True iff the note ran without errors (regardless of
         whether all sub-notes were auto-submitted). The batch driver
@@ -5664,6 +5669,18 @@ class BrowserWorker:
             )
             tail = "" if all_submitted else "  (left open — submit unchecked)"
             self.on_status(f"Done: {scenario.name!r} (course {course_code!r}).{tail}")
+            # A single-student note left for review (submit unchecked) is filled
+            # but not committed — bring the browser forward so the user actually
+            # SEES the form to review + submit, instead of it filling invisibly
+            # (a deep-link nav runs in the background / the browser is minimized,
+            # so the fire otherwise looks like it did nothing). Batches pass
+            # raise_on_review=False so they don't pop the window per student.
+            if raise_on_review and not all_submitted:
+                try:
+                    target.bring_to_front()
+                except Exception:
+                    pass
+                self._raise_browser_window()
             self.on_note_filed(NoteLogEntry(
                 timestamp=datetime.now(),
                 scenario=scenario.name,
