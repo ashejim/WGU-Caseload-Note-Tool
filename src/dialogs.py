@@ -1338,14 +1338,21 @@ def prompt_edit_note(parent, label, body_prefill, course_default,
 
         def _sync_ea_close(*_a):
             v = ea_sel.get()
-            locked = (v != "skip" and _ea_is_locked_task(eas[int(v)]))
+            attached = (v != "skip")
+            locked = (attached and _ea_is_locked_task(eas[int(v)]))
+            # Close only applies to an ATTACHED, non-locked EA: grey it out when
+            # nothing's attached ("Don't attach") or the EA is locked.
             try:
-                if locked:
+                if not attached or locked:
                     ea_close.set(False)
                     ea_close_cb.configure(state="disabled")
-                    locked_hint.pack(anchor="w", padx=12, pady=(0, 4))
                 else:
                     ea_close_cb.configure(state="normal")
+                # The hint explains only the locked case ("Don't attach" is
+                # self-explanatory).
+                if locked:
+                    locked_hint.pack(anchor="w", padx=12, pady=(0, 4))
+                else:
                     locked_hint.pack_forget()
             except Exception:
                 pass
