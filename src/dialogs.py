@@ -1132,11 +1132,17 @@ def prompt_fill_note_template(parent, template, prefill=None):
 
 
 def _ea_is_locked_task(ea) -> bool:
-    """True if an EA looks like a locked Assessment Task (so the note dialog can
-    offer a jump to the dashboard to approve/reject the unlock). Permissive —
-    matches 'locked' or an assessment-task phrasing, case-insensitive."""
-    r = str((ea or {}).get("reason", "") or "").lower()
-    return "lock" in r or ("assessment" in r and "task" in r)
+    """True if an EA looks like a locked Assessment Task — so the note dialog can
+    (a) offer a jump to the dashboard to approve/reject the unlock and (b) refuse
+    to 'close' it (a locked task can't be closed from a note; trying breaks the
+    save). Checks ALL the EA's text fields, not just the reason, because the
+    'locked'/'unlock' signal often lives in the Intervention, not the Name.
+    Matches 'lock' (covers locked / unlock) or an assessment-task phrasing."""
+    ea = ea or {}
+    text = " ".join(
+        str(ea.get(k, "") or "") for k in
+        ("reason", "intervention", "event_progress")).lower()
+    return "lock" in text or ("assessment" in text and "task" in text)
 
 
 def prompt_edit_note(parent, label, body_prefill, course_default,
@@ -1317,10 +1323,35 @@ def prompt_edit_note(parent, label, body_prefill, course_default,
             ctk.CTkRadioButton(
                 eabox, text=t, variable=ea_sel, value=str(i),
             ).pack(anchor="w", padx=8, pady=1)
-        ctk.CTkCheckBox(
+        ea_close_cb = ctk.CTkCheckBox(
             dialog, text="Close the Essential Action when the note is saved",
             variable=ea_close, font=ctk.CTkFont(size=11),
-        ).pack(anchor="w", padx=12, pady=(0, 4))
+        )
+        ea_close_cb.pack(anchor="w", padx=12, pady=(0, 0))
+        # A LOCKED task can be attached to a note but NOT closed from one —
+        # trying to close it fails and the note doesn't save. So disable "close"
+        # while a locked EA is selected (you unlock it on the dashboard instead).
+        locked_hint = ctk.CTkLabel(
+            dialog, text="A locked task can't be closed from a note — unlock it "
+            "on the dashboard below.", font=ctk.CTkFont(size=10),
+            text_color=("gray45", "gray60"), anchor="w", justify="left")
+
+        def _sync_ea_close(*_a):
+            v = ea_sel.get()
+            locked = (v != "skip" and _ea_is_locked_task(eas[int(v)]))
+            try:
+                if locked:
+                    ea_close.set(False)
+                    ea_close_cb.configure(state="disabled")
+                    locked_hint.pack(anchor="w", padx=12, pady=(0, 4))
+                else:
+                    ea_close_cb.configure(state="normal")
+                    locked_hint.pack_forget()
+            except Exception:
+                pass
+
+        ea_sel.trace_add("write", _sync_ea_close)
+        _sync_ea_close()
         # Locked Assessment Task: attaching the EA to a note doesn't unlock the
         # task — that's done on the Essential Actions dashboard (⊕ next to the
         # student → Approve/Reject). Offer a one-click jump so the unlock step is
@@ -1345,8 +1376,9 @@ def prompt_edit_note(parent, label, body_prefill, course_default,
         v = ea_sel.get()
         if eas and v != "skip":
             ea = eas[int(v)]
-            ea_choice = (ea.get("reason", ""), ea.get("course", ""),
-                         bool(ea_close.get()))
+            # A locked task can be attached but never closed from a note.
+            close = bool(ea_close.get()) and not _ea_is_locked_task(ea)
+            ea_choice = (ea.get("reason", ""), ea.get("course", ""), close)
         chosen_type = type_var.get().strip()
         # Never send activities for a type that doesn't take them.
         acts = ([] if activities_disabled_for(fmt, chosen_type)

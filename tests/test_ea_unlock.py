@@ -22,6 +22,16 @@ def test_ignores_unrelated_eas():
         assert not _ea_is_locked_task({"reason": reason}), reason
 
 
+def test_matches_locked_signal_in_intervention():
+    # The 'locked'/'unlock' signal often lives in Intervention, not the reason.
+    assert _ea_is_locked_task(
+        {"reason": "Objective Assessment", "intervention": "Assessment Unlock"})
+    assert _ea_is_locked_task(
+        {"reason": "Assessment", "intervention": "Unlock Request"})
+    assert _ea_is_locked_task(
+        {"reason": "PA", "event_progress": "Task Locked"})
+
+
 def test_tolerates_missing_or_bad_input():
     assert not _ea_is_locked_task({})
     assert not _ea_is_locked_task(None)
