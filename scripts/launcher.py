@@ -12276,6 +12276,51 @@ class App:
         if any(n.append_clipboard for n in scenario.notes):
             clipboard = self._read_clipboard_content()
 
+        # Step 3b: EMAIL FIRST (no-cost case). When firing on a caseload row
+        # whose email context is complete (a student email is present), review
+        # the email UP FRONT — before the text/note dialogs and before any
+        # navigation — using the ROW context, exactly as batch fires do, and SEND
+        # it after nav (Step 5). This yields the natural email → text → note order
+        # without navigating first (which would bury the popup) or a scrape.
+        # Main-window / off-caseload email fires (no row, or no email in the row)
+        # fall through to the post-nav scraped review at Step 5.
+        email_upfront = None      # dict when reviewed here; None → Step 5 handles it
+        fire_row = None
+        if prenav_student_id or chosen_name:
+            try:
+                fire_row = self._row_for_student(
+                    prenav_student_id or "", chosen_name or "")
+            except Exception:
+                fire_row = None
+        if scenario.email is not None and fire_row is not None:
+            probe = self._ctx_from_csv_row(fire_row)
+            if probe.get("student_email"):
+                who_email = (self._row_name_and_query(fire_row)[0]
+                             or chosen_name or "this student")
+                scenario, e_confirmed, e_body_ov, e_addr_ov, e_skip = \
+                    self._review_emails(scenario, [fire_row], prompt_vars,
+                                        who_email)
+                if e_confirmed is None:
+                    self._append_log("Email review cancelled; action not fired.")
+                    return
+                if not e_confirmed:
+                    self._append_log(f"{scenario.name!r}: nothing left to do.")
+                    return
+                email_upfront = {
+                    "send": (0 not in e_skip),
+                    "ctx": {**probe, **prompt_vars},
+                    "body_override": e_body_ov.get(0),
+                    "addr": e_addr_ov.get(0) or {},
+                }
+
+        # Step 3c: TEXT REVIEW (front-loaded before the note dialog, so the
+        # input order is email → text → note). The SEND is deferred to after the
+        # email below. deferred_text = prepared payload, or False to skip.
+        deferred_text = False
+        if scenario.text is not None:
+            deferred_text = self._fire_text(
+                scenario, chosen_name, prompt_vars, defer_send=True)
+
         # Step 4: per-note fire-time edit. A note that opts into "Edit note
         # at fire time" pops a single dialog to edit the body, course code,
         # academic activities, and — if the student has open Essential
@@ -12388,15 +12433,6 @@ class App:
             if offer_ea and res.get("ea"):
                 ea_arg = res["ea"]
 
-        # Step 4b: TEXT REVIEW now (front-load all user input) — review/edit the
-        # text up front but DEFER the send until after the email below, so every
-        # prompt/review happens before any send and the user can walk away while
-        # the tool works. deferred_text = prepared payload, or False to skip.
-        deferred_text = False
-        if scenario.text is not None:
-            deferred_text = self._fire_text(
-                scenario, chosen_name, prompt_vars, defer_send=True)
-
         # All up-front user input is collected — NOW navigate to the student
         # (deferred from Step 1). Doing it here, with no dialog open, means the
         # browser un-minimizing can't bury a popup, and the record is open
@@ -12416,11 +12452,28 @@ class App:
                     "scenario not fired.")
                 return
 
+        # Step 5a: email SEND for the up-front-reviewed (row) case — the review
+        # already happened before nav (Step 3b); just send it now, from the row
+        # context, so the execution order stays email → text → note.
+        if scenario.email is not None and email_upfront is not None:
+            if email_upfront["send"]:
+                _ov = email_upfront["addr"]
+                if not self._send_scenario_email(
+                    scenario.email, email_upfront["ctx"], auto_send=True,
+                    body_html_override=email_upfront["body_override"],
+                    cc_override=_ov.get("cc"), bcc=_ov.get("bcc", ""),
+                ):
+                    self._append_log("Email send failed; note not filed.")
+                    return
+            else:
+                self._append_log("Email skipped (deselected); filing note only.")
+
         # Step 5: email (if scenario has one). Reviewed in the same in-app
         # previewer as batch/selection (incl. the fire-time template
         # dropdown when opted in), then auto-sent. Rendered from the
-        # scraped student context since there's no CSV row here.
-        if scenario.email is not None:
+        # scraped student context since there's no CSV row here. Only for fires
+        # NOT already reviewed up front (main-window / off-caseload).
+        if scenario.email is not None and email_upfront is None:
             # Off-caseload student open on the record → build the email context
             # from the scraped profile (lookup_caseload_student finds no row, so
             # student_email/PM/course would come back blank otherwise). Prefer it
