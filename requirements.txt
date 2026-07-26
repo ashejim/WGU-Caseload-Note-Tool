@@ -8,3 +8,6 @@ pywin32>=305 ; sys_platform == "win32"
 # Windows/standalone Python ships no system tz database; zoneinfo needs this
 # for the timezone-aware texting scheduler (and student-local-time display).
 tzdata>=2024.1
+# Offline spell-check in the text editors (bundled English dictionary; no
+# network). Degrades to a no-op if missing, so it's a soft dependency.
+pyspellchecker>=0.8

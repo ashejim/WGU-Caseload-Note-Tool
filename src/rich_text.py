@@ -23,6 +23,7 @@ import tkinter.font as tkfont
 from tkinter import ttk
 
 from src.config import email_link_color
+from src import spellcheck
 from src.ui_common import SECONDARY_BTN_KWARGS
 
 
@@ -287,6 +288,8 @@ class RichTextEditor:
         self.text.bind("<KeyPress-space>", self._on_space)
         # Rich paste: keep links/bold/etc. when the clipboard carries HTML.
         self.text.bind("<<Paste>>", self._on_paste)
+        # Offline spell-check: red underline + right-click suggestions.
+        self._spellcheck = spellcheck.attach(self.text)
 
     # ----- setup -----
 

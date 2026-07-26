@@ -18,7 +18,7 @@ import customtkinter as ctk
 import tkinter as tk
 from tkinter import ttk
 
-from src import email_template, hotkeys
+from src import email_template, hotkeys, spellcheck
 from src.config import templates_dir
 from src.note_form import (
     ACADEMIC_ACTIVITY_LABELS, INTERACTION_FORMATS,
@@ -720,6 +720,7 @@ def prompt_quick_note(parent, *, default_type: str = "Admin Note",
 
     ctk.CTkLabel(body_frame, text="Note:").pack(anchor="w")
     body_box = ctk.CTkTextbox(body_frame, height=150, wrap="word")
+    spellcheck.attach(body_box)
     body_box.pack(fill="x", pady=(0, 4))
 
     def _refresh(*_a):
@@ -814,6 +815,7 @@ def prompt_additional_text(parent, label: str, prefilled: str,
     ).pack(padx=12, pady=(10, 4), anchor="w")
 
     text_box = ctk.CTkTextbox(dialog, wrap="word")
+    spellcheck.attach(text_box)
     text_box.pack(fill="both", expand=True, padx=12, pady=4)
     content = prefilled
     if content and content[-1] not in (" ", "\n", "\t"):
@@ -1048,6 +1050,7 @@ def prompt_fill_note_template(parent, template, prefill=None):
         ).pack(fill="x", padx=6, pady=(6, 0))
         if f.kind == "multiline":
             w = ctk.CTkTextbox(form, wrap="word", height=70)
+            spellcheck.attach(w)
             w.pack(fill="x", padx=6, pady=(0, 2))
             if seed:
                 w.insert("1.0", seed)
@@ -1256,6 +1259,7 @@ def prompt_edit_note(parent, label, body_prefill, course_default,
     ctk.CTkLabel(dialog, text="Note body:", anchor="w").pack(
         fill="x", padx=12, pady=(6, 0))
     text_box = ctk.CTkTextbox(dialog, wrap="word", height=150)
+    spellcheck.attach(text_box)
     text_box.pack(fill="both", expand=True, padx=12, pady=(0, 0))
     c = body_prefill or ""
     if c and c[-1] not in (" ", "\n", "\t"):
@@ -1468,6 +1472,7 @@ def prompt_text_review(
     ctk.CTkLabel(dialog, text="Message:", anchor="w").pack(
         fill="x", padx=12, pady=(2, 0))
     box = ctk.CTkTextbox(dialog, wrap="word", height=150, width=460)
+    spellcheck.attach(box)
     box.pack(fill="both", expand=True, padx=12, pady=(0, 2))
     box.insert("1.0", body or "")
     box.mark_set("insert", "end-1c")

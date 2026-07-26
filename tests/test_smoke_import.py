@@ -39,6 +39,7 @@ SRC_MODULES = [
     "src.browser_worker",
     "src.queue_panel",
     "src.rich_text",
+    "src.spellcheck",
     "src.dialogs",
     "src.ema_links",
     "src.names",

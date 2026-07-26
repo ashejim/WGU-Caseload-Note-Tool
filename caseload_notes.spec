@@ -28,6 +28,11 @@ ctk_datas = collect_data_files("customtkinter")
 # files aren't auto-detected, so collect them explicitly.
 tzdata_datas = collect_data_files("tzdata")
 
+# pyspellchecker ships per-language frequency dictionaries as package data; the
+# offline spell-check only uses English, so bundle just en.json.gz (~2 MB).
+spell_datas = [d for d in collect_data_files("spellchecker")
+               if os.path.basename(d[0]) == "en.json.gz"]
+
 a = Analysis(
     ["scripts/launcher.py"],
     pathex=["."],
@@ -38,6 +43,7 @@ a = Analysis(
         *_res_datas,       # splash.gif / app.ico when present
         *ctk_datas,
         *tzdata_datas,
+        *spell_datas,
     ],
     hiddenimports=[
         "customtkinter",
@@ -45,6 +51,7 @@ a = Analysis(
         "pynput.keyboard._win32",
         "pynput.mouse._win32",
         "tzdata",
+        "spellchecker",
     ],
     hookspath=[],
     runtime_hooks=[],
