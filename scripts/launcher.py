@@ -7689,6 +7689,13 @@ class CaseloadPanel:
         menu.add_command(
             label="Review notes",
             command=lambda q=query, l=label: self.review_notes(q, l))
+        # Task unlock: jump to the Essential Actions dashboard (raised) to
+        # approve/reject a locked-task request for this student.
+        _sid = str(row.get("StudentID", "")
+                   or row.get("Student ID", "")).strip()
+        menu.add_command(
+            label="🔓 Unlock tasks (EA dashboard)…",
+            command=lambda s=_sid, l=label: self.app._open_ea_dashboard(s, l))
         fire_index = None
         nonbatch = self._panel_action_scenarios()
         if nonbatch:
@@ -11058,6 +11065,44 @@ class App:
         self.worker.submit_find_student(
             query, new_tab=new_tab, raise_after=raise_after)
 
+    def _open_ea_dashboard(self, student_id: str = "", name: str = "",
+                           allow_when_busy: bool = False) -> None:
+        """Open the Essential Actions dashboard in the app's (logged-in) browser
+        and bring it to the front, so the user can unlock a task by hand: click
+        the ⊕ left of the student's name → Approve or Reject. First step of the
+        task-unlock feature (auto-locate/auto-approve come later).
+
+        `allow_when_busy` is set when called from the fire-time note dialog: the
+        fire has marked the app busy but is PAUSED on that modal dialog, so the
+        worker is free to navigate. The subsequent note fire re-opens the record
+        (deferred nav), so leaving the browser on the dashboard is fine."""
+        if self._is_busy and not allow_when_busy:
+            self._append_log(
+                "Busy — finish the current task before opening the Essential "
+                "Actions dashboard.")
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        who = (name or "").strip()
+        self._append_log(
+            f"Opening the Essential Actions dashboard{(' for ' + who) if who else ''}… "
+            "Find the student, click the ⊕ next to their name, then Approve or "
+            "Reject to unlock the task.")
+
+        def on_done(res):
+            def show():
+                if (res or {}).get("error"):
+                    self._append_log(
+                        f"Couldn't open the EA dashboard: {res['error']}",
+                        error=True)
+            try:
+                self.root.after(0, show)
+            except Exception:
+                show()
+
+        self.worker.submit_open_ea_dashboard(on_done, student_id, name)
+
     def _probe_unlock(self) -> None:
         """TEMP: dump the open task-unlock popup + EA row icons (for building
         the unlock feature). Run with the 'Approve or Reject' popup open."""
@@ -12418,7 +12463,11 @@ class App:
                 subject_default=n.subject,
                 note_templates=self.note_templates,
                 on_manage_templates=self._manage_templates_from_picker,
-                default_template=default_tmpl)
+                default_template=default_tmpl,
+                on_open_ea_dashboard=(
+                    (lambda s=sid, nm=chosen_name: self._open_ea_dashboard(
+                        s, nm, allow_when_busy=True))
+                    if offer_ea else None))
             if res is None:
                 self._append_log(f"{label} edit cancelled; action not fired.")
                 return

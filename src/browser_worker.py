@@ -179,6 +179,16 @@ class BrowserWorker:
         on_done({eas:[{student_id,name,reason,...}]})."""
         self.q.put(("READ_EA_DASHBOARD", on_done))
 
+    def submit_open_ea_dashboard(
+        self, on_done: Callable[[dict], None],
+        student_id: str = "", name: str = "",
+    ) -> None:
+        """Open the Essential Actions DASHBOARD in the browser and raise its
+        window, so the user can approve/reject a task-unlock request manually
+        (click the ⊕ left of a student's name → Approve or Reject).
+        on_done({ok}|{error})."""
+        self.q.put(("OPEN_EA_DASHBOARD", on_done, student_id, name))
+
     def submit_probe_unlock(self, on_done: Callable[[dict], None]) -> None:
         """TEMP: dump the open task-unlock popup + EA row icons. on_done({path})."""
         self.q.put(("PROBE_UNLOCK", on_done))
@@ -611,6 +621,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._read_ea_dashboard(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "OPEN_EA_DASHBOARD":
+            _, on_done, sid, name = cmd
+            res = {}
+            try:
+                res = self._open_ea_dashboard_page(ctx, sid, name)
             finally:
                 on_done(res)
         elif cmd[0] == "PROBE_UNLOCK":
@@ -5121,6 +5138,32 @@ class BrowserWorker:
             return {"eas": read_essential_actions(target)}
         except Exception as e:
             return {"error": str(e)}
+
+    def _open_ea_dashboard_page(self, ctx, student_id: str = "",
+                                name: str = "") -> dict:
+        """Open the Essential Actions dashboard in the browser and pull its
+        window to the OS foreground, so the user can approve/reject a task
+        unlock by hand: click the ⊕ left of the student's name → Approve or
+        Reject. `student_id` / `name` are for logging only (v0 doesn't yet
+        auto-locate the row). Leaves the browser ON the dashboard (unlike the
+        scrape, which navigates back) so the user can act."""
+        from src.config import ESSENTIAL_ACTIONS_URL
+        target = self._active_page(ctx)
+        if target is None:
+            return {"error": "no active page"}
+        if not ESSENTIAL_ACTIONS_URL:
+            return {"error": "ESSENTIAL_ACTIONS_URL not set"}
+        try:
+            target.goto(ESSENTIAL_ACTIONS_URL, wait_until="domcontentloaded")
+            target.wait_for_timeout(500)
+            try:
+                target.bring_to_front()
+            except Exception:
+                pass
+            self._raise_browser_window()
+            return {"ok": True}
+        except Exception as e:
+            return {"error": f"couldn't open the EA dashboard: {e}"}
 
     def _read_ea_dashboard(self, ctx) -> dict:
         """Navigate to the Essential Actions dashboard, scroll-load + read

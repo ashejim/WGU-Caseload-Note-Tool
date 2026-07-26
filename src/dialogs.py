@@ -1131,12 +1131,21 @@ def prompt_fill_note_template(parent, template, prefill=None):
     return res["value"]
 
 
+def _ea_is_locked_task(ea) -> bool:
+    """True if an EA looks like a locked Assessment Task (so the note dialog can
+    offer a jump to the dashboard to approve/reject the unlock). Permissive —
+    matches 'locked' or an assessment-task phrasing, case-insensitive."""
+    r = str((ea or {}).get("reason", "") or "").lower()
+    return "lock" in r or ("assessment" in r and "task" in r)
+
+
 def prompt_edit_note(parent, label, body_prefill, course_default,
                      activities_on, eas, enter_submits: bool = True,
                      interaction_type: str = "",
                      interaction_format: str = "Single Interaction",
                      subject_default: str = "", note_templates=None,
-                     on_manage_templates=None, default_template=None):
+                     on_manage_templates=None, default_template=None,
+                     on_open_ea_dashboard=None):
     """Unified fire-time note dialog: edit the body, subject, course code,
     note type, and academic activities, and — when the student has open
     Essential Actions — attach/close one. Returns
@@ -1312,6 +1321,24 @@ def prompt_edit_note(parent, label, body_prefill, course_default,
             dialog, text="Close the Essential Action when the note is saved",
             variable=ea_close, font=ctk.CTkFont(size=11),
         ).pack(anchor="w", padx=12, pady=(0, 4))
+        # Locked Assessment Task: attaching the EA to a note doesn't unlock the
+        # task — that's done on the Essential Actions dashboard (⊕ next to the
+        # student → Approve/Reject). Offer a one-click jump so the unlock step is
+        # right here in the note flow. Shown when an EA looks like a locked task.
+        if on_open_ea_dashboard is not None and any(
+                _ea_is_locked_task(ea) for ea in eas):
+            ctk.CTkButton(
+                dialog, text="🔓  Open the EA dashboard to unlock this task",
+                height=32, font=ctk.CTkFont(size=12, weight="bold"),
+                command=lambda: on_open_ea_dashboard(),
+            ).pack(fill="x", padx=12, pady=(2, 6))
+            ctk.CTkLabel(
+                dialog,
+                text="Approve or reject the unlock on the dashboard, then come "
+                     "back to file this note.",
+                font=ctk.CTkFont(size=10), text_color=("gray45", "gray60"),
+                anchor="w", justify="left",
+            ).pack(fill="x", padx=12, pady=(0, 4))
 
     def _cont(_e=None):
         ea_choice = None
