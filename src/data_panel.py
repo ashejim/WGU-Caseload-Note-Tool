@@ -710,11 +710,12 @@ class DataPanel:
         self.status.configure(text=(
             f"Completion by month — {tot} students across {len(months)} months, "
             f"bucketed by {axis}. Bars = students that month (left axis, count). "
-            "Green = ACTUAL pass rate (passed ÷ resolved); grey dashed = the WGU "
-            f"Momentum indicator's PREDICTED rate — the midpoint of each "
-            f"student's {mom} Momentum band (Low 0-20 → 10% … High 80-100 → "
-            "90%), averaged over the month (right axis, %). Where actual sits "
-            "ABOVE predicted, students are beating the indicator. Note: "
+            "Green = ACTUAL pass rate (passed ÷ resolved); the shaded band = the "
+            "WGU Momentum indicator's PREDICTED range — each student's "
+            f"{mom} Momentum band (Low 0-20% … High 80-100%), averaged low-to-"
+            "high over the month (right axis, %; dashed line = midpoint). Where "
+            "actual sits ABOVE the band, students are beating the indicator. "
+            "Note: "
             "non-passes only resolve at term end, so actual reads high until "
             "terms close."))
         self._draw_completion()
@@ -763,7 +764,8 @@ class DataPanel:
         c.create_text(L - 4, y_ct(maxct), anchor="e", fill=fg,     # left axis
                       text=str(maxct), font=("", 8))
         bw = min(slot * 0.6, 42)
-        act_pts, pred_pts = [], []
+        act_pts, mid_pts = [], []
+        hi_pts, lo_pts = [], []            # predicted band upper / lower edges
         for i, m in enumerate(months):
             cx = L + slot * (i + 0.5)
             if m["total"]:
@@ -772,15 +774,29 @@ class DataPanel:
                                    outline="")
             if m["actual_rate"] is not None:
                 act_pts.append((cx, y_pct(100 * m["actual_rate"])))
-            if m["predicted_rate"] is not None:
-                pred_pts.append((cx, y_pct(100 * m["predicted_rate"])))
+            if m.get("predicted_high") is not None:
+                hi_pts.append((cx, y_pct(100 * m["predicted_high"])))
+                lo_pts.append((cx, y_pct(100 * m["predicted_low"])))
+                mid_pts.append((cx, y_pct(100 * m["predicted_rate"])))
             c.create_text(cx, H - B + 12, text=m["month"], fill=fg, font=("", 7))
-        for i in range(len(pred_pts) - 1):              # predicted: dashed grey
-            c.create_line(*pred_pts[i], *pred_pts[i + 1], fill=pred_col, width=2,
+        # Predicted Momentum band: a see-through shaded range from the mean band
+        # LOW bound to the mean HIGH bound, drawn over the bars (stipple lets them
+        # show through). Faint dashed center line = the midpoint prediction.
+        if len(hi_pts) >= 2:
+            poly = [xy for pt in hi_pts for xy in pt]
+            poly += [xy for pt in reversed(lo_pts) for xy in pt]
+            c.create_polygon(*poly, fill=pred_col, stipple="gray25", outline="")
+            c.create_line(*[xy for pt in hi_pts for xy in pt], fill=pred_col,
+                          width=1)
+            c.create_line(*[xy for pt in lo_pts for xy in pt], fill=pred_col,
+                          width=1)
+        elif hi_pts:                        # single month → vertical range bar
+            (cx, yh), (_, yl) = hi_pts[0], lo_pts[0]
+            c.create_rectangle(cx - bw / 2, yh, cx + bw / 2, yl, fill=pred_col,
+                               stipple="gray25", outline=pred_col)
+        for i in range(len(mid_pts) - 1):               # predicted midpoint
+            c.create_line(*mid_pts[i], *mid_pts[i + 1], fill=pred_col, width=1,
                           dash=(4, 3))
-        for cx, cy in pred_pts:
-            c.create_oval(cx - 2, cy - 2, cx + 2, cy + 2, fill=pred_col,
-                          outline="")
         for i in range(len(act_pts) - 1):               # actual: solid green
             c.create_line(*act_pts[i], *act_pts[i + 1], fill=act_col, width=2)
         for cx, cy in act_pts:
@@ -793,10 +809,10 @@ class DataPanel:
         c.create_line(L + 72, ly - 4, L + 94, ly - 4, fill=act_col, width=2)
         c.create_text(L + 98, ly - 4, anchor="w", fill=fg, font=("", 8),
                       text="actual")
-        c.create_line(L + 150, ly - 4, L + 172, ly - 4, fill=pred_col, width=2,
-                      dash=(4, 3))
+        c.create_rectangle(L + 150, ly - 8, L + 172, ly - 1, fill=pred_col,
+                           stipple="gray25", outline=pred_col)
         c.create_text(L + 176, ly - 4, anchor="w", fill=fg, font=("", 8),
-                      text="predicted")
+                      text="predicted band")
 
     # ---- view: at-risk students (table) ---------------------------------
     # Column key (matches history.at_risk_students() fields), heading, width,

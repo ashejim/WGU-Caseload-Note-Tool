@@ -1315,16 +1315,23 @@ def outcomes_over_time(*, db_path=HISTORY_DB, weeks_back=16,
     return {"weeks": weeks}
 
 
-def momentum_band_rate(rank) -> Optional[float]:
-    """WGU's PREDICTED pass probability (0..1) for a Momentum rank — the MIDPOINT
-    of that band's published range (Low 0-20 → .10, Med-Low 20-40 → .30, …, High
-    80-100 → .90). This is the indicator's own prediction, NOT a trained model.
-    None for an unknown/blank rank."""
+def momentum_band_bounds(rank):
+    """(low, high) predicted pass-probability bounds (0..1) for a Momentum rank —
+    the band's published range (Low 0-20 → (.0, .2) … High 80-100 → (.8, 1.0)).
+    (None, None) for an unknown/blank rank."""
     for r, _label, rng in _MOMENTUM_BANDS:
         if r == rank:
             lo, hi = (int(v) for v in rng.split("-"))
-            return (lo + hi) / 200.0
-    return None
+            return lo / 100.0, hi / 100.0
+    return None, None
+
+
+def momentum_band_rate(rank) -> Optional[float]:
+    """WGU's PREDICTED pass probability (0..1) for a Momentum rank — the MIDPOINT
+    of that band's published range (Low 0-20 → .10 … High 80-100 → .90). The
+    indicator's own prediction, NOT a trained model. None for unknown/blank."""
+    lo, hi = momentum_band_bounds(rank)
+    return None if lo is None else (lo + hi) / 2.0
 
 
 def completion_by_month(*, by="start", basis="entry", courses=None,
@@ -1340,10 +1347,11 @@ def completion_by_month(*, by="start", basis="entry", courses=None,
     the outcome (the value at the time they passed/resolved) — the same choice as
     the calibration view.
 
-    Per month: ``{month, total, passed, resolved, actual_rate, predicted_rate}``
-    where actual_rate = passed ÷ resolved and predicted_rate = mean Momentum-band
-    midpoint over students that month with a reading (rates 0..1 or None).
-    ``courses`` restricts the set."""
+    Per month: ``{month, total, passed, resolved, actual_rate, predicted_rate,
+    predicted_low, predicted_high}`` where actual_rate = passed ÷ resolved,
+    predicted_rate = mean Momentum-band midpoint, and predicted_low/high = mean of
+    the band LOW/HIGH bounds over students that month with a reading (the band
+    drawn as a translucent range). Rates 0..1 or None. ``courses`` restricts."""
     today = (now or datetime.now()).date()
     lower = _parse_date(date_from)
     upper = min(_parse_date(date_to) or today, today)
@@ -1361,27 +1369,31 @@ def completion_by_month(*, by="start", basis="entry", courses=None,
             continue
         month = d.replace(day=1)
         b = buckets.setdefault(month, {"total": 0, "passed": 0, "resolved": 0,
-                                       "pred_sum": 0.0, "pred_n": 0})
+                                       "lo_sum": 0.0, "hi_sum": 0.0, "pred_n": 0})
         b["total"] += 1
         if o.get("outcome") == "passed":
             b["passed"] += 1
         if resolved:
             b["resolved"] += 1
-        pr = momentum_band_rate(o.get(rank_key))
-        if pr is not None:
-            b["pred_sum"] += pr
+        lo, hi = momentum_band_bounds(o.get(rank_key))
+        if lo is not None:
+            b["lo_sum"] += lo
+            b["hi_sum"] += hi
             b["pred_n"] += 1
     months = []
     for m in sorted(buckets):
         b = buckets[m]
+        n = b["pred_n"]
+        lo = (b["lo_sum"] / n) if n else None
+        hi = (b["hi_sum"] / n) if n else None
         months.append({
             "month": m.isoformat()[:7],
             "total": b["total"], "passed": b["passed"],
             "resolved": b["resolved"],
             "actual_rate": (b["passed"] / b["resolved"]) if b["resolved"]
             else None,
-            "predicted_rate": (b["pred_sum"] / b["pred_n"]) if b["pred_n"]
-            else None,
+            "predicted_low": lo, "predicted_high": hi,
+            "predicted_rate": ((lo + hi) / 2.0) if lo is not None else None,
         })
     return {"months": months}
 
