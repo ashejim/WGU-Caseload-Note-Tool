@@ -1315,60 +1315,40 @@ def outcomes_over_time(*, db_path=HISTORY_DB, weeks_back=16,
     return {"weeks": weeks}
 
 
-def momentum_completion_model(*, courses=None, min_n=8, db_path=HISTORY_DB,
-                              now: Optional[datetime] = None) -> dict:
-    """P(pass) by ENTRY-momentum rank (1..5), from RESOLVED outcomes — the basis
-    for the completion estimator. A rank with fewer than ``min_n`` resolved
-    samples falls back to the overall rate (keeps sparse bands from swinging).
-    Returns ``{rank: rate, None: overall_rate}`` (``{}`` if nothing resolved).
-    ``courses`` restricts the basis to a subset of course codes."""
-    from collections import defaultdict
-    today = (now or datetime.now()).date()
-    agg = defaultdict(lambda: [0, 0])   # rank -> [passed, total]
-    allc = [0, 0]
-    for o in all_outcomes(db_path=db_path):
-        if courses is not None and o["course_code"] not in courses:
-            continue
-        rd = _resolution_date(o)
-        if rd is None or rd > today:
-            continue                    # unresolved: final outcome unknown
-        passed = 1 if o.get("outcome") == "passed" else 0
-        allc[0] += passed
-        allc[1] += 1
-        rank = o.get("entry_momentum_rank")
-        if rank is not None:
-            agg[rank][0] += passed
-            agg[rank][1] += 1
-    if not allc[1]:
-        return {}
-    overall = allc[0] / allc[1]
-    model = {None: overall}
-    for rank, (p, t) in agg.items():
-        model[rank] = (p / t) if t >= min_n else overall
-    return model
+def momentum_band_rate(rank) -> Optional[float]:
+    """WGU's PREDICTED pass probability (0..1) for a Momentum rank — the MIDPOINT
+    of that band's published range (Low 0-20 → .10, Med-Low 20-40 → .30, …, High
+    80-100 → .90). This is the indicator's own prediction, NOT a trained model.
+    None for an unknown/blank rank."""
+    for r, _label, rng in _MOMENTUM_BANDS:
+        if r == rank:
+            lo, hi = (int(v) for v in rng.split("-"))
+            return (lo + hi) / 200.0
+    return None
 
 
-def completion_by_month(*, by="start", courses=None, db_path=HISTORY_DB,
-                        date_from=None, date_to=None,
+def completion_by_month(*, by="start", basis="entry", courses=None,
+                        db_path=HISTORY_DB, date_from=None, date_to=None,
                         now: Optional[datetime] = None) -> dict:
-    """Course completion by month, with a momentum ESTIMATE alongside the ACTUAL.
+    """Course completion by month — ACTUAL pass rate vs the WGU Momentum
+    indicator's PREDICTED pass rate (the midpoint of each student's Momentum
+    band; the indicator's own prediction, not a trained model).
 
-    ``by="start"`` buckets students by their course-START month (a cohort):
-    actual rate = passed / resolved-so-far, while the estimate projects the WHOLE
-    cohort (incl. students still in progress) from each one's entry momentum ×
-    the historical momentum→completion model — so the estimate leads actual for
-    cohorts that haven't fully resolved. ``by="resolution"`` buckets by the
-    resolution month (pass date / term end); every student there is resolved, so
-    actual = passed / total (the estimate then just cross-checks the model).
+    ``by="start"`` buckets by course-START month (a cohort); ``"resolution"``
+    buckets by the resolution month (pass date / term end). ``basis="entry"``
+    reads each student's entry-time Momentum band; ``"exit"`` reads their band at
+    the outcome (the value at the time they passed/resolved) — the same choice as
+    the calibration view.
 
-    ``courses`` restricts both the chart and the estimate basis. Each month:
-    ``{month, total, passed, resolved, actual_rate, est_rate}`` (rates 0..1 or
-    None). Also returns the ``model`` used."""
-    model = momentum_completion_model(courses=courses, db_path=db_path, now=now)
-    overall = model.get(None)
+    Per month: ``{month, total, passed, resolved, actual_rate, predicted_rate}``
+    where actual_rate = passed ÷ resolved and predicted_rate = mean Momentum-band
+    midpoint over students that month with a reading (rates 0..1 or None).
+    ``courses`` restricts the set."""
     today = (now or datetime.now()).date()
     lower = _parse_date(date_from)
     upper = min(_parse_date(date_to) or today, today)
+    rank_key = ("entry_momentum_rank" if basis == "entry"
+                else "momentum_rank_at_outcome")
     buckets = {}
     for o in all_outcomes(db_path=db_path):
         if courses is not None and o["course_code"] not in courses:
@@ -1380,15 +1360,17 @@ def completion_by_month(*, by="start", courses=None, db_path=HISTORY_DB,
         if d is None or (lower and d < lower) or d > upper:
             continue
         month = d.replace(day=1)
-        b = buckets.setdefault(month, {"total": 0, "passed": 0,
-                                       "resolved": 0, "est_sum": 0.0})
+        b = buckets.setdefault(month, {"total": 0, "passed": 0, "resolved": 0,
+                                       "pred_sum": 0.0, "pred_n": 0})
         b["total"] += 1
         if o.get("outcome") == "passed":
             b["passed"] += 1
         if resolved:
             b["resolved"] += 1
-        if overall is not None:
-            b["est_sum"] += model.get(o.get("entry_momentum_rank"), overall)
+        pr = momentum_band_rate(o.get(rank_key))
+        if pr is not None:
+            b["pred_sum"] += pr
+            b["pred_n"] += 1
     months = []
     for m in sorted(buckets):
         b = buckets[m]
@@ -1398,10 +1380,10 @@ def completion_by_month(*, by="start", courses=None, db_path=HISTORY_DB,
             "resolved": b["resolved"],
             "actual_rate": (b["passed"] / b["resolved"]) if b["resolved"]
             else None,
-            "est_rate": (b["est_sum"] / b["total"])
-            if (b["total"] and overall is not None) else None,
+            "predicted_rate": (b["pred_sum"] / b["pred_n"]) if b["pred_n"]
+            else None,
         })
-    return {"months": months, "model": model}
+    return {"months": months}
 
 
 def momentum_drift(*, db_path=HISTORY_DB, course_load="all",

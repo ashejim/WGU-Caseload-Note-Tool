@@ -1,114 +1,106 @@
-"""Tests for the completion-by-month chart data + momentum estimator model
-(history.momentum_completion_model / completion_by_month), on a temp DB.
+"""Tests for the completion-by-month chart data (history.completion_by_month)
+and the WGU Momentum-band predicted rate (momentum_band_rate), on a temp DB.
+The 'predicted' line is the indicator's own band midpoint — NOT a trained model.
 """
 import os
 import sqlite3
 import sys
 import tempfile
-from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src import history  # noqa: E402
 
-# A fixed "today" so resolution/window logic is deterministic.
 _NOW = __import__("datetime").datetime(2026, 6, 15)
 
 
 def _seed(rows):
-    """Make a temp history DB with the given outcome rows and return its path.
-    Each row: (course, outcome, entry_rank, start, pass_date, term_end)."""
+    """Temp history DB from outcome rows. Each row:
+    (course, outcome, entry_rank, exit_rank, start, pass_date, term_end)."""
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     os.unlink(path)
-    conn = history._connect(path)   # creates schema
-    for i, (course, outcome, rank, start, passd, term) in enumerate(rows):
+    conn = history._connect(path)
+    for i, (course, outcome, er, xr, start, passd, term) in enumerate(rows):
         conn.execute(
             "INSERT INTO outcomes (student_id, course_code, outcome, "
-            "entry_momentum_rank, course_start_date, pass_date, term_end_date) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (str(i), course, outcome, rank, start, passd, term))
+            "entry_momentum_rank, momentum_rank_at_outcome, course_start_date, "
+            "pass_date, term_end_date) VALUES (?,?,?,?,?,?,?,?)",
+            (str(i), course, outcome, er, xr, start, passd, term))
     conn.commit()
     conn.close()
     return path
 
 
-def test_model_rates_by_rank_with_fallback():
-    # rank 5: 4 passed / 5 resolved = .8 (>= min_n won't trigger at min_n=2);
-    # rank 1: 1 sample → below min_n=2 → falls back to overall.
+def test_momentum_band_rate_midpoints():
+    # WGU bands: Low 0-20 -> .10 ... High 80-100 -> .90.
+    assert history.momentum_band_rate(1) == 0.10   # Low
+    assert history.momentum_band_rate(2) == 0.30   # Med Low
+    assert history.momentum_band_rate(3) == 0.50   # Med
+    assert history.momentum_band_rate(4) == 0.70   # Med High
+    assert history.momentum_band_rate(5) == 0.90   # High
+    assert history.momentum_band_rate(None) is None
+    assert history.momentum_band_rate(9) is None
+
+
+def test_predicted_is_mean_band_midpoint_entry():
+    # Two entrants: High (.90) + Low (.10) → predicted 0.50. Both passed.
     rows = [
-        ("X", "passed", 5, "2026-01-01", "2026-02-01", None),
-        ("X", "passed", 5, "2026-01-01", "2026-02-01", None),
-        ("X", "passed", 5, "2026-01-01", "2026-02-01", None),
-        ("X", "passed", 5, "2026-01-01", "2026-02-01", None),
-        ("X", "not_passed", 5, "2026-01-01", None, "2026-03-01"),
-        ("X", "not_passed", 1, "2026-01-01", None, "2026-03-01"),
+        ("X", "passed", 5, 5, "2026-01-10", "2026-02-01", None),
+        ("X", "passed", 1, 1, "2026-01-10", "2026-02-01", None),
     ]
     p = _seed(rows)
     try:
-        m = history.momentum_completion_model(db_path=p, min_n=2, now=_NOW)
-        assert abs(m[5] - 0.8) < 1e-9, m               # 4 passed / 5 resolved
-        assert abs(m[None] - 4 / 6) < 1e-9, m          # 4 passed of 6 resolved
-        assert m[1] == m[None]                          # rank 1 too sparse → fallback
+        d = history.completion_by_month(by="start", basis="entry", db_path=p,
+                                        now=_NOW)
+        jan = [m for m in d["months"] if m["month"] == "2026-01"][0]
+        assert abs(jan["predicted_rate"] - 0.50) < 1e-9, jan
+        assert jan["actual_rate"] == 1.0            # both passed
     finally:
         os.unlink(p)
 
 
-def test_model_excludes_unresolved():
-    # A not_passed whose term end is in the FUTURE isn't resolved → excluded.
-    rows = [
-        ("X", "passed", 5, "2026-01-01", "2026-02-01", None),
-        ("X", "not_passed", 5, "2026-01-01", None, "2026-12-31"),  # future term
-    ]
+def test_entry_vs_exit_basis_differ():
+    # Entry High (.90) but exit Low (.10) — the two bases give different lines.
+    rows = [("X", "passed", 5, 1, "2026-01-10", "2026-02-01", None)]
     p = _seed(rows)
     try:
-        m = history.momentum_completion_model(db_path=p, min_n=1, now=_NOW)
-        assert m[None] == 1.0            # only the resolved pass counts
+        de = history.completion_by_month(basis="entry", db_path=p, now=_NOW)
+        dx = history.completion_by_month(basis="exit", db_path=p, now=_NOW)
+        assert de["months"][0]["predicted_rate"] == 0.90
+        assert dx["months"][0]["predicted_rate"] == 0.10
     finally:
         os.unlink(p)
 
 
-def test_completion_by_start_projects_inprogress():
-    # A Jan cohort: 1 passed (resolved), 1 in-progress (future term).
+def test_actual_counts_resolved_only():
+    # Jan cohort: 1 passed (resolved), 1 in-progress (future term, unresolved).
     rows = [
-        ("X", "passed", 5, "2026-01-10", "2026-02-01", None),
-        ("X", "not_passed", 5, "2026-01-10", None, "2026-12-31"),  # in progress
+        ("X", "passed", 5, 5, "2026-01-10", "2026-02-01", None),
+        ("X", "not_passed", 1, 1, "2026-01-10", None, "2026-12-31"),
     ]
     p = _seed(rows)
     try:
         d = history.completion_by_month(by="start", db_path=p, now=_NOW)
-        jan = [m for m in d["months"] if m["month"] == "2026-01"][0]
-        assert jan["total"] == 2 and jan["resolved"] == 1 and jan["passed"] == 1
-        assert jan["actual_rate"] == 1.0        # 1 passed of 1 resolved
-        assert jan["est_rate"] is not None      # projects both students
+        jan = d["months"][0]
+        assert jan["total"] == 2 and jan["resolved"] == 1
+        assert jan["actual_rate"] == 1.0            # 1 passed of 1 resolved
+        # predicted averages BOTH students' entry bands: (.90 + .10)/2 = .50
+        assert abs(jan["predicted_rate"] - 0.50) < 1e-9
     finally:
         os.unlink(p)
 
 
-def test_completion_by_resolution_only_resolved():
+def test_by_resolution_and_course_filter():
     rows = [
-        ("X", "passed", 5, "2026-01-10", "2026-02-05", None),      # resolves Feb
-        ("X", "not_passed", 5, "2026-01-10", None, "2026-12-31"),  # unresolved
+        ("A", "passed", 5, 5, "2026-01-10", "2026-02-05", None),
+        ("B", "passed", 5, 5, "2026-01-10", "2026-02-05", None),
     ]
     p = _seed(rows)
     try:
-        d = history.completion_by_month(by="resolution", db_path=p, now=_NOW)
+        d = history.completion_by_month(by="resolution", courses={"A"},
+                                        db_path=p, now=_NOW)
         assert [m["month"] for m in d["months"]] == ["2026-02"]
-        feb = d["months"][0]
-        assert feb["total"] == 1 and feb["actual_rate"] == 1.0
-    finally:
-        os.unlink(p)
-
-
-def test_course_filter():
-    rows = [
-        ("A", "passed", 5, "2026-01-10", "2026-02-01", None),
-        ("B", "passed", 5, "2026-01-10", "2026-02-01", None),
-    ]
-    p = _seed(rows)
-    try:
-        d = history.completion_by_month(by="start", courses={"A"}, db_path=p,
-                                        now=_NOW)
         assert sum(m["total"] for m in d["months"]) == 1
     finally:
         os.unlink(p)

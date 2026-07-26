@@ -32,6 +32,8 @@ class DataPanel:
                     "Completion": "completion"}
     # Completion-view month axis (label -> history.completion_by_month `by`).
     _COMPL_BY = {"By course start": "start", "By resolution": "resolution"}
+    # Which Momentum reading drives the predicted line (entry vs at-outcome).
+    _COMPL_BASIS = {"Entry momentum": "entry", "Exit momentum": "exit"}
     # Calibration basis + course-load options (label -> key), mirroring the
     # 📈 Momentum dialog so the two stay consistent.
     _BASES = {"Entry — fair": "entry", "Entry — proxy": "all",
@@ -66,6 +68,7 @@ class DataPanel:
         self._over = None           # over-time cache
         self._compl = None          # completion-by-month cache
         self.compl_by = "start"     # completion month axis
+        self.compl_basis = "entry"  # Momentum reading for the predicted line
 
     # ---- mount / pop-out -------------------------------------------------
     def attach(self, tab) -> None:
@@ -647,6 +650,13 @@ class DataPanel:
         am.set(next((k for k, v in self._COMPL_BY.items()
                      if v == self.compl_by), "By course start"))
         am.pack(side="left")
+        bm = ctk.CTkOptionMenu(
+            opts, width=140, values=list(self._COMPL_BASIS),
+            command=lambda v: self._set_compl_basis(
+                self._COMPL_BASIS.get(v, "entry")))
+        bm.set(next((k for k, v in self._COMPL_BASIS.items()
+                     if v == self.compl_basis), "Entry momentum"))
+        bm.pack(side="left", padx=(6, 0))
         ctk.CTkLabel(opts, text="Courses:").pack(side="left", padx=(10, 4))
         codes = history.course_codes()
         if self.courses is None:
@@ -664,6 +674,11 @@ class DataPanel:
 
     def _set_compl_by(self, by) -> None:
         self.compl_by = by
+        self._compl = None
+        self._render_completion()
+
+    def _set_compl_basis(self, basis) -> None:
+        self.compl_basis = basis
         self._compl = None
         self._render_completion()
 
@@ -685,20 +700,23 @@ class DataPanel:
             return
         df, dt_ = self._date_bounds()
         self._compl = history.completion_by_month(
-            by=self.compl_by, courses=self.courses, date_from=df, date_to=dt_)
+            by=self.compl_by, basis=self.compl_basis, courses=self.courses,
+            date_from=df, date_to=dt_)
         months = self._compl["months"]
         tot = sum(m["total"] for m in months)
         axis = ("course start (a cohort)" if self.compl_by == "start"
                 else "resolution date")
+        mom = ("entry" if self.compl_basis == "entry" else "at-outcome")
         self.status.configure(text=(
             f"Completion by month — {tot} students across {len(months)} months, "
             f"bucketed by {axis}. Bars = students that month (left axis, count). "
-            "Green = ACTUAL completion (passed ÷ resolved); blue dashed = "
-            "ESTIMATE from each student's entry momentum × the historical "
-            "momentum→completion rate (right axis, %). The estimate projects "
-            "students still in progress, so it leads actual for cohorts not yet "
-            "resolved. Note: non-passes only resolve at term end, so both rates "
-            "read high until terms close."))
+            "Green = ACTUAL pass rate (passed ÷ resolved); grey dashed = the WGU "
+            f"Momentum indicator's PREDICTED rate — the midpoint of each "
+            f"student's {mom} Momentum band (Low 0-20 → 10% … High 80-100 → "
+            "90%), averaged over the month (right axis, %). Where actual sits "
+            "ABOVE predicted, students are beating the indicator. Note: "
+            "non-passes only resolve at term end, so actual reads high until "
+            "terms close."))
         self._draw_completion()
 
     def _draw_completion(self) -> None:
@@ -715,7 +733,7 @@ class DataPanel:
         bg = "#1d1e1e" if dark else "#f9f9fa"
         bar_col = self._blend("#4a9eff", bg, 0.55)
         act_col = "#3fb950"
-        est_col = "#4a9eff"
+        pred_col = "#9aa0a6"        # WGU-predicted line (grey, like calibration)
         months = self._compl["months"]
         L, R, T, B = 34, 38, 26, 44
         pw, ph = W - L - R, H - T - B
@@ -740,12 +758,12 @@ class DataPanel:
         for p in (0, 50, 100):                          # right axis = %
             y = y_pct(p)
             c.create_line(L, y, L + pw, y, fill=grid)
-            c.create_text(L + pw + 6, y, anchor="w", fill=est_col,
+            c.create_text(L + pw + 6, y, anchor="w", fill=fg,
                           text=f"{p}%", font=("", 8))
         c.create_text(L - 4, y_ct(maxct), anchor="e", fill=fg,     # left axis
                       text=str(maxct), font=("", 8))
         bw = min(slot * 0.6, 42)
-        act_pts, est_pts = [], []
+        act_pts, pred_pts = [], []
         for i, m in enumerate(months):
             cx = L + slot * (i + 0.5)
             if m["total"]:
@@ -754,14 +772,14 @@ class DataPanel:
                                    outline="")
             if m["actual_rate"] is not None:
                 act_pts.append((cx, y_pct(100 * m["actual_rate"])))
-            if m["est_rate"] is not None:
-                est_pts.append((cx, y_pct(100 * m["est_rate"])))
+            if m["predicted_rate"] is not None:
+                pred_pts.append((cx, y_pct(100 * m["predicted_rate"])))
             c.create_text(cx, H - B + 12, text=m["month"], fill=fg, font=("", 7))
-        for i in range(len(est_pts) - 1):               # estimate: dashed blue
-            c.create_line(*est_pts[i], *est_pts[i + 1], fill=est_col, width=2,
+        for i in range(len(pred_pts) - 1):              # predicted: dashed grey
+            c.create_line(*pred_pts[i], *pred_pts[i + 1], fill=pred_col, width=2,
                           dash=(4, 3))
-        for cx, cy in est_pts:
-            c.create_oval(cx - 2, cy - 2, cx + 2, cy + 2, fill=est_col,
+        for cx, cy in pred_pts:
+            c.create_oval(cx - 2, cy - 2, cx + 2, cy + 2, fill=pred_col,
                           outline="")
         for i in range(len(act_pts) - 1):               # actual: solid green
             c.create_line(*act_pts[i], *act_pts[i + 1], fill=act_col, width=2)
@@ -775,10 +793,10 @@ class DataPanel:
         c.create_line(L + 72, ly - 4, L + 94, ly - 4, fill=act_col, width=2)
         c.create_text(L + 98, ly - 4, anchor="w", fill=fg, font=("", 8),
                       text="actual")
-        c.create_line(L + 150, ly - 4, L + 172, ly - 4, fill=est_col, width=2,
+        c.create_line(L + 150, ly - 4, L + 172, ly - 4, fill=pred_col, width=2,
                       dash=(4, 3))
         c.create_text(L + 176, ly - 4, anchor="w", fill=fg, font=("", 8),
-                      text="estimate")
+                      text="predicted")
 
     # ---- view: at-risk students (table) ---------------------------------
     # Column key (matches history.at_risk_students() fields), heading, width,
