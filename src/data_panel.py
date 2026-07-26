@@ -23,11 +23,15 @@ class DataPanel:
     _VIEWS = {"Pass rate vs prediction": "calibration",
               "At-risk students": "atrisk",
               "Momentum trajectory": "trajectory",
-              "Pass rate over time": "overtime"}
+              "Pass rate over time": "overtime",
+              "Completion by month": "completion"}
     # Short labels for the on-screen view switcher (segmented button — must stay
-    # compact so all four fit the narrow docked pane).
+    # compact so all fit the narrow docked pane).
     _VIEW_LABELS = {"Calibration": "calibration", "At-risk": "atrisk",
-                    "Trajectory": "trajectory", "Over time": "overtime"}
+                    "Trajectory": "trajectory", "Over time": "overtime",
+                    "Completion": "completion"}
+    # Completion-view month axis (label -> history.completion_by_month `by`).
+    _COMPL_BY = {"By course start": "start", "By resolution": "resolution"}
     # Calibration basis + course-load options (label -> key), mirroring the
     # 📈 Momentum dialog so the two stay consistent.
     _BASES = {"Entry — fair": "entry", "Entry — proxy": "all",
@@ -60,6 +64,8 @@ class DataPanel:
         self._data = None           # calibration cache
         self._traj = None           # trajectory cache
         self._over = None           # over-time cache
+        self._compl = None          # completion-by-month cache
+        self.compl_by = "start"     # completion month axis
 
     # ---- mount / pop-out -------------------------------------------------
     def attach(self, tab) -> None:
@@ -123,6 +129,9 @@ class DataPanel:
         elif v == "overtime":
             self._build_overtime_controls(self.ctrls)
             self._view_overtime(self.content)
+        elif v == "completion":
+            self._build_completion_controls(self.ctrls)
+            self._view_completion(self.content)
         else:
             self._build_calibration_controls(self.ctrls)
             self._view_calibration(self.content)
@@ -168,15 +177,7 @@ class DataPanel:
 
     def _set_dates(self, days) -> None:
         self.date_days = days
-        if self.view == "calibration":
-            self._data = None
-            self._render_calibration()
-        elif self.view == "trajectory":
-            self._traj = None
-            self._render_trajectory()
-        elif self.view == "overtime":
-            self._over = None
-            self._render_overtime()
+        self._recompute_current()
 
     def _build_calibration_controls(self, opts) -> None:
         self.basis_menu = ctk.CTkOptionMenu(
@@ -217,8 +218,22 @@ class DataPanel:
             self.courses.add(code)
         else:
             self.courses.discard(code)
-        self._data = None
-        self._render_calibration()
+        self._recompute_current()
+
+    def _recompute_current(self) -> None:
+        """Clear the active view's cache and redraw (after a control change)."""
+        if self.view == "calibration":
+            self._data = None
+            self._render_calibration()
+        elif self.view == "trajectory":
+            self._traj = None
+            self._render_trajectory()
+        elif self.view == "overtime":
+            self._over = None
+            self._render_overtime()
+        elif self.view == "completion":
+            self._compl = None
+            self._render_completion()
 
     def _select_view(self, key) -> None:
         self.view = key
@@ -303,6 +318,10 @@ class DataPanel:
             if self._over is not None:
                 self._over = None
                 self._render_overtime()
+        elif self.view == "completion":
+            if self._compl is not None:
+                self._compl = None
+                self._render_completion()
         elif self.view == "atrisk":
             self._build_view()
 
@@ -618,6 +637,148 @@ class DataPanel:
         c.create_line(L + 182, ly - 4, L + 204, ly - 4, fill=rate_col, width=2)
         c.create_text(L + 208, ly - 4, anchor="w", fill=fg, font=("", 8),
                       text="pass rate")
+
+    # ---- view: completion by month (bars + actual/estimate lines) --------
+    def _build_completion_controls(self, opts) -> None:
+        ctk.CTkLabel(opts, text="Month:").pack(side="left", padx=(0, 4))
+        am = ctk.CTkOptionMenu(
+            opts, width=150, values=list(self._COMPL_BY),
+            command=lambda v: self._set_compl_by(self._COMPL_BY.get(v, "start")))
+        am.set(next((k for k, v in self._COMPL_BY.items()
+                     if v == self.compl_by), "By course start"))
+        am.pack(side="left")
+        ctk.CTkLabel(opts, text="Courses:").pack(side="left", padx=(10, 4))
+        codes = history.course_codes()
+        if self.courses is None:
+            self.courses = set(codes)
+        for i, code in enumerate(codes):
+            var = ctk.BooleanVar(value=(code in self.courses))
+            color = self._course_color(i)
+            ctk.CTkCheckBox(
+                opts, text=code, variable=var, width=20,
+                checkbox_width=15, checkbox_height=15,
+                font=ctk.CTkFont(size=11), fg_color=color, hover_color=color,
+                command=lambda c=code, vv=var: self._toggle_course(c, vv),
+            ).pack(side="left", padx=(0, 6))
+        self._build_date_control(opts)
+
+    def _set_compl_by(self, by) -> None:
+        self.compl_by = by
+        self._compl = None
+        self._render_completion()
+
+    def _view_completion(self, parent) -> None:
+        dark = ctk.get_appearance_mode() == "Dark"
+        self.canvas = tk.Canvas(parent, bd=0, highlightthickness=0,
+                                bg=("#1d1e1e" if dark else "#f9f9fa"))
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.canvas.bind("<Configure>", lambda e: self._on_compl_configure())
+
+    def _on_compl_configure(self) -> None:
+        if self.canvas is None or self.canvas.winfo_width() < 120:
+            return
+        (self._render_completion() if self._compl is None
+         else self._draw_completion())
+
+    def _render_completion(self) -> None:
+        if self.canvas is None:
+            return
+        df, dt_ = self._date_bounds()
+        self._compl = history.completion_by_month(
+            by=self.compl_by, courses=self.courses, date_from=df, date_to=dt_)
+        months = self._compl["months"]
+        tot = sum(m["total"] for m in months)
+        axis = ("course start (a cohort)" if self.compl_by == "start"
+                else "resolution date")
+        self.status.configure(text=(
+            f"Completion by month — {tot} students across {len(months)} months, "
+            f"bucketed by {axis}. Bars = students that month (left axis, count). "
+            "Green = ACTUAL completion (passed ÷ resolved); blue dashed = "
+            "ESTIMATE from each student's entry momentum × the historical "
+            "momentum→completion rate (right axis, %). The estimate projects "
+            "students still in progress, so it leads actual for cohorts not yet "
+            "resolved. Note: non-passes only resolve at term end, so both rates "
+            "read high until terms close."))
+        self._draw_completion()
+
+    def _draw_completion(self) -> None:
+        c = self.canvas
+        if c is None or not self._compl:
+            return
+        c.delete("all")
+        W, H = c.winfo_width(), c.winfo_height()
+        if W < 160 or H < 120:
+            return
+        dark = ctk.get_appearance_mode() == "Dark"
+        fg = "#c0c0c0" if dark else "#444444"
+        grid = "#333333" if dark else "#dddddd"
+        bg = "#1d1e1e" if dark else "#f9f9fa"
+        bar_col = self._blend("#4a9eff", bg, 0.55)
+        act_col = "#3fb950"
+        est_col = "#4a9eff"
+        months = self._compl["months"]
+        L, R, T, B = 34, 38, 26, 44
+        pw, ph = W - L - R, H - T - B
+        if pw < 60 or ph < 50:
+            return
+        c.create_text(L, 12, anchor="w", fill=fg, font=("", 10, "bold"),
+                      text="Completion by month — actual vs momentum estimate")
+        if not months:
+            c.create_text(W / 2, H / 2, fill=fg,
+                          text="No completion data in range yet.")
+            return
+        maxct = max((m["total"] for m in months), default=1) or 1
+        n = len(months)
+        slot = pw / n
+
+        def y_ct(v):
+            return T + ph * (1 - v / maxct)
+
+        def y_pct(p):
+            return T + ph * (1 - p / 100.0)
+
+        for p in (0, 50, 100):                          # right axis = %
+            y = y_pct(p)
+            c.create_line(L, y, L + pw, y, fill=grid)
+            c.create_text(L + pw + 6, y, anchor="w", fill=est_col,
+                          text=f"{p}%", font=("", 8))
+        c.create_text(L - 4, y_ct(maxct), anchor="e", fill=fg,     # left axis
+                      text=str(maxct), font=("", 8))
+        bw = min(slot * 0.6, 42)
+        act_pts, est_pts = [], []
+        for i, m in enumerate(months):
+            cx = L + slot * (i + 0.5)
+            if m["total"]:
+                c.create_rectangle(cx - bw / 2, y_ct(m["total"]),
+                                   cx + bw / 2, y_ct(0), fill=bar_col,
+                                   outline="")
+            if m["actual_rate"] is not None:
+                act_pts.append((cx, y_pct(100 * m["actual_rate"])))
+            if m["est_rate"] is not None:
+                est_pts.append((cx, y_pct(100 * m["est_rate"])))
+            c.create_text(cx, H - B + 12, text=m["month"], fill=fg, font=("", 7))
+        for i in range(len(est_pts) - 1):               # estimate: dashed blue
+            c.create_line(*est_pts[i], *est_pts[i + 1], fill=est_col, width=2,
+                          dash=(4, 3))
+        for cx, cy in est_pts:
+            c.create_oval(cx - 2, cy - 2, cx + 2, cy + 2, fill=est_col,
+                          outline="")
+        for i in range(len(act_pts) - 1):               # actual: solid green
+            c.create_line(*act_pts[i], *act_pts[i + 1], fill=act_col, width=2)
+        for cx, cy in act_pts:
+            c.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill=act_col,
+                          outline="")
+        ly = H - 8                                       # legend
+        c.create_rectangle(L, ly - 7, L + 12, ly - 1, fill=bar_col, outline="")
+        c.create_text(L + 16, ly - 4, anchor="w", fill=fg, font=("", 8),
+                      text="students")
+        c.create_line(L + 72, ly - 4, L + 94, ly - 4, fill=act_col, width=2)
+        c.create_text(L + 98, ly - 4, anchor="w", fill=fg, font=("", 8),
+                      text="actual")
+        c.create_line(L + 150, ly - 4, L + 172, ly - 4, fill=est_col, width=2,
+                      dash=(4, 3))
+        c.create_text(L + 176, ly - 4, anchor="w", fill=fg, font=("", 8),
+                      text="estimate")
 
     # ---- view: at-risk students (table) ---------------------------------
     # Column key (matches history.at_risk_students() fields), heading, width,

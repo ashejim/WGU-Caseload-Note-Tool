@@ -1315,6 +1315,95 @@ def outcomes_over_time(*, db_path=HISTORY_DB, weeks_back=16,
     return {"weeks": weeks}
 
 
+def momentum_completion_model(*, courses=None, min_n=8, db_path=HISTORY_DB,
+                              now: Optional[datetime] = None) -> dict:
+    """P(pass) by ENTRY-momentum rank (1..5), from RESOLVED outcomes — the basis
+    for the completion estimator. A rank with fewer than ``min_n`` resolved
+    samples falls back to the overall rate (keeps sparse bands from swinging).
+    Returns ``{rank: rate, None: overall_rate}`` (``{}`` if nothing resolved).
+    ``courses`` restricts the basis to a subset of course codes."""
+    from collections import defaultdict
+    today = (now or datetime.now()).date()
+    agg = defaultdict(lambda: [0, 0])   # rank -> [passed, total]
+    allc = [0, 0]
+    for o in all_outcomes(db_path=db_path):
+        if courses is not None and o["course_code"] not in courses:
+            continue
+        rd = _resolution_date(o)
+        if rd is None or rd > today:
+            continue                    # unresolved: final outcome unknown
+        passed = 1 if o.get("outcome") == "passed" else 0
+        allc[0] += passed
+        allc[1] += 1
+        rank = o.get("entry_momentum_rank")
+        if rank is not None:
+            agg[rank][0] += passed
+            agg[rank][1] += 1
+    if not allc[1]:
+        return {}
+    overall = allc[0] / allc[1]
+    model = {None: overall}
+    for rank, (p, t) in agg.items():
+        model[rank] = (p / t) if t >= min_n else overall
+    return model
+
+
+def completion_by_month(*, by="start", courses=None, db_path=HISTORY_DB,
+                        date_from=None, date_to=None,
+                        now: Optional[datetime] = None) -> dict:
+    """Course completion by month, with a momentum ESTIMATE alongside the ACTUAL.
+
+    ``by="start"`` buckets students by their course-START month (a cohort):
+    actual rate = passed / resolved-so-far, while the estimate projects the WHOLE
+    cohort (incl. students still in progress) from each one's entry momentum ×
+    the historical momentum→completion model — so the estimate leads actual for
+    cohorts that haven't fully resolved. ``by="resolution"`` buckets by the
+    resolution month (pass date / term end); every student there is resolved, so
+    actual = passed / total (the estimate then just cross-checks the model).
+
+    ``courses`` restricts both the chart and the estimate basis. Each month:
+    ``{month, total, passed, resolved, actual_rate, est_rate}`` (rates 0..1 or
+    None). Also returns the ``model`` used."""
+    model = momentum_completion_model(courses=courses, db_path=db_path, now=now)
+    overall = model.get(None)
+    today = (now or datetime.now()).date()
+    lower = _parse_date(date_from)
+    upper = min(_parse_date(date_to) or today, today)
+    buckets = {}
+    for o in all_outcomes(db_path=db_path):
+        if courses is not None and o["course_code"] not in courses:
+            continue
+        rd = _resolution_date(o)
+        resolved = rd is not None and rd <= today
+        d = (rd if resolved else None) if by == "resolution" \
+            else _parse_date(o.get("course_start_date"))
+        if d is None or (lower and d < lower) or d > upper:
+            continue
+        month = d.replace(day=1)
+        b = buckets.setdefault(month, {"total": 0, "passed": 0,
+                                       "resolved": 0, "est_sum": 0.0})
+        b["total"] += 1
+        if o.get("outcome") == "passed":
+            b["passed"] += 1
+        if resolved:
+            b["resolved"] += 1
+        if overall is not None:
+            b["est_sum"] += model.get(o.get("entry_momentum_rank"), overall)
+    months = []
+    for m in sorted(buckets):
+        b = buckets[m]
+        months.append({
+            "month": m.isoformat()[:7],
+            "total": b["total"], "passed": b["passed"],
+            "resolved": b["resolved"],
+            "actual_rate": (b["passed"] / b["resolved"]) if b["resolved"]
+            else None,
+            "est_rate": (b["est_sum"] / b["total"])
+            if (b["total"] and overall is not None) else None,
+        })
+    return {"months": months, "model": model}
+
+
 def momentum_drift(*, db_path=HISTORY_DB, course_load="all",
                    date_from=None, date_to=None) -> dict:
     """How each entry-band's students MOVED by exit, for the resolved students
