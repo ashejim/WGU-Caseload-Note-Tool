@@ -167,6 +167,24 @@ text, batch filters, and hotkey, then **Save**) or directly in the YAML file. A
 fresh install ships a small set of **Sample** actions marked *edit or delete me*
 to start from.
 
+## Security & privacy
+
+CaseloadNotes runs **entirely on your machine, under your own login** — there is
+no server, no account, and nothing is sent to the author or any third party.
+
+- **No credentials are stored in this repository or by the app.** You sign in to
+  Salesforce yourself, in a real browser window, using your normal SSO + MFA. The
+  authenticated session lives only in a local `browser_data/` folder on your PC
+  and never leaves it. Access to WGU systems is always gated by *your* SSO and
+  MFA — having the source code grants no access to any data.
+- **Student data (FERPA) stays local.** Caseload exports, notes, texting
+  contacts, and history snapshots are written only to your machine and are
+  excluded from source control. Local PII files can additionally be **encrypted
+  at rest** behind an app password (**⚙ Settings**).
+- **What's in the repo is code only** — no student records, no session tokens, no
+  API keys. See [SECURITY.md](SECURITY.md) for the full statement and how to
+  report an issue.
+
 ## Known issues
 
 - **Smart App Control blocks the .exe** on first run — see Quick start step 2.

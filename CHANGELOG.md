@@ -3,6 +3,34 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.22.0 — 2026-07-29
+
+- **Interactive first-run walkthrough.** New users get an opt-in guided
+  golden-path tour: create your first group, add and **fire a safe bundled test
+  action**, take the batch tour, and set up at-rest encryption — with a
+  **persistent checklist** you can resume anytime. Firing goes through the normal
+  reviewed flow (no dry-run engine), so nothing goes out unseen.
+- **Task unlock (v0).** Open the **Essential Actions dashboard** for a student
+  straight from a caseload row or the note flow. A locked-assessment EA now shows
+  the **unlock link** and blocks the *close* action from a note, and the EA
+  *close* button is greyed out whenever nothing is attached (*"Don't attach"*), so
+  you can't file an empty close.
+- **Offline spell-check in the text editors.** The note/email/text editors now
+  underline misspellings with a bundled dictionary — no network, learns your
+  custom words.
+- **Data → "Completion by month" chart.** See course completions over time with a
+  **course filter** and a **Momentum-prediction estimate**, drawn as a
+  see-through **high–low band** so the projection reads as a range, not a false
+  point estimate. The estimate uses WGU's Momentum *prediction* — not a locally
+  trained model.
+- **Email-first input order for caseload-row fires.** When firing from a caseload
+  row with no added cost, the email is composed first, keeping the input flow
+  consistent with panel fires.
+- **Security & privacy statement.** Added `SECURITY.md` and a README section
+  documenting that the app stores no credentials (access is always gated by your
+  own SSO + MFA) and keeps all student data local. Scrubbed a sample student ID
+  from a code docstring/test.
+
 ## 0.21.0 — 2026-07-21
 
 - **Reorganized the action buttons into tabs.** Groups now show as a **tab

@@ -15,7 +15,7 @@ _EMA_URL_RE = re.compile(
 
 def parse_ema_url(url: str) -> Optional[dict]:
     """Pull the ids out of an EMA Score Report URL, e.g.
-    https://tasks.wgu.edu/student/009930908/course/33860018/task/4521/score-report
+    https://tasks.wgu.edu/student/000000000/course/33860018/task/4521/score-report
     -> {student_id, course_id, task_id}. None if it doesn't match."""
     m = _EMA_URL_RE.search(url or "")
     if not m:
