@@ -1070,12 +1070,37 @@ class BrowserWorker:
             pass
         return 1
 
+    def _await_caseload_list(self, target, timeout: int = 20_000):
+        """Wait until the main caseload LIST has rendered and return its
+        <table> locator; raises on timeout.
+
+        Readiness is gated on the list's own 'Search All Rows…' search box —
+        a view-INDEPENDENT element present whatever columns the user's custom
+        list view shows. The previous check waited for a 'Name' column header,
+        but a slimmed-down default view (e.g. Course Code + Course Instructor
+        only) omits Name, so that wait timed out and silently broke EVERY
+        caseload load / CSV export / archive export for such views — the data
+        itself comes from the getCaseLoadMainGridData grid JSON and never
+        depended on the visible columns. The table is then matched by its
+        always-present 'Course Code' header (the search-box gate already proves
+        it's the real list, not a stale/empty render, so a second column header
+        is no longer needed to disambiguate)."""
+        target.locator(
+            'input[placeholder="Search All Rows..."]'
+        ).first.wait_for(state="visible", timeout=timeout)
+        table = (
+            target.locator("table")
+            .filter(has=target.locator('th:has-text("Course Code")'))
+            .first
+        )
+        table.wait_for(state="visible", timeout=timeout)
+        return table
+
     def _ensure_caseload_list(self, target) -> bool:
-        """Navigate `target` to the Caseload list and wait for the list
-        table to render. The table must have BOTH a Course Code header
-        AND a Name header — the Essential Actions panels match Course
-        Code only, so a looser wait would settle on a stale empty table.
-        Returns True once the real list is visible."""
+        """Navigate `target` to the Caseload list and wait for the list table
+        to render (via _await_caseload_list, which keys off the list's own
+        'Search All Rows…' box so it works regardless of which columns the
+        user's view shows). Returns True once the real list is visible."""
         if not CASELOAD_URL:
             return False
         # Lightning sometimes raises "Navigation interrupted" when its own
@@ -1086,12 +1111,7 @@ class BrowserWorker:
         except Exception as e:
             self.on_status(f"  [debug] goto caseload: {e}")
         try:
-            list_table = (
-                target.locator("table")
-                .filter(has=target.locator('th:has-text("Course Code")'))
-                .filter(has=target.locator('th:has-text("Name")'))
-            )
-            list_table.first.wait_for(state="visible", timeout=20_000)
+            self._await_caseload_list(target)
             return True
         except Exception as e:
             self.on_status(f"Caseload list table didn't load in time: {e}")
@@ -1103,10 +1123,13 @@ class BrowserWorker:
         the list is plainly present and the student just isn't in the
         ~10 visible rows (the row filter, not a reload, finds those)."""
         try:
+            # Course Code header only — a slimmed-down list view may omit the
+            # Name column, and requiring it here made this report "not present"
+            # on such views, forcing a needless full reload. Matches the
+            # view-independent detection in _await_caseload_list.
             return (
                 target.locator("table")
                 .filter(has=target.locator('th:has-text("Course Code")'))
-                .filter(has=target.locator('th:has-text("Name")'))
                 .count() > 0
             )
         except Exception:
@@ -1884,16 +1907,37 @@ class BrowserWorker:
                 # instead of giving up (column-independent).
                 q = (query or "").strip()
                 cid = ""
+                matched_name = ""
                 if re.fullmatch(r"\d{5,12}", q):
                     try:
                         cid = (self.grid_student_contact_map().get(q)
                                or "").strip()
                     except Exception:
                         cid = ""
+                else:
+                    # A NAME query on a list view WITHOUT a Name column: the row
+                    # filter can't match a hidden column and the DOM row-scanner
+                    # needs one, so both come up empty. Resolve the name against
+                    # the live grid (Name + contactID) and deep-link instead —
+                    # view-independent, same as the Student-ID path above.
+                    try:
+                        rcid, matched_name, n_hits = self.grid_contact_for_name(q)
+                    except Exception:
+                        rcid, matched_name, n_hits = "", "", 0
+                    if n_hits == 1:
+                        cid = rcid
+                    elif n_hits > 1:
+                        self.on_status(
+                            f"{n_hits} caseload students match {q!r} — type the "
+                            "Student ID, or add the Name column to your list "
+                            "view, to pick the right one.")
                 if cid.startswith("003") and self._navigate_to_contact(ctx, cid):
+                    detail = (f"→ matched {matched_name!r} in the grid"
+                              if matched_name
+                              else "(Student ID column not in the caseload view?)")
                     self.on_status(
-                        f"  Row filter missed {q!r} (Student ID column not in "
-                        "the caseload view?) — deep-linked by Contact id.")
+                        f"  Row filter missed {q!r} {detail} — deep-linked by "
+                        "Contact id.")
                     if raise_after:
                         try:
                             self._bring_browser_forward(target)
@@ -1940,12 +1984,7 @@ class BrowserWorker:
             except Exception as e:
                 self.on_status(f"  [debug] goto note: {e}")
             try:
-                list_table = (
-                    target.locator("table")
-                    .filter(has=target.locator('th:has-text("Course Code")'))
-                    .filter(has=target.locator('th:has-text("Name")'))
-                )
-                list_table.first.wait_for(state="visible", timeout=20_000)
+                self._await_caseload_list(target)
             except Exception as e:
                 self.on_status(f"Caseload table didn't load: {e}")
                 self._last_matches = []
@@ -2987,6 +3026,35 @@ class BrowserWorker:
                 out[sid] = cid
         return out
 
+    def grid_contact_for_name(self, query: str) -> tuple:
+        """Resolve a NAME query to a single Contact id via the live caseload
+        grid. getCaseLoadMainGridData carries Name + contactID for every
+        student, so this is view-INDEPENDENT — it works even when the list view
+        omits the Name column, which makes the DOM row-scan matcher find nothing
+        and the row filter unable to match a hidden column. Returns
+        (contact_id, matched_name, n_matches): n 0 = none, 1 = unique
+        (contact_id set), >1 = ambiguous (contact_id '')."""
+        q = (query or "").strip().lower()
+        if not q:
+            return "", "", 0
+        hits, seen = [], set()
+        for row in self.grid_rows_by_key().values():
+            try:
+                name = str(row.get("Name") or "").strip()
+                cid = str(row.get("contactID") or "").strip()
+            except Exception:
+                continue
+            if not name or not cid.startswith("003"):
+                continue
+            if q in name.lower():
+                key = (name.lower(), cid)
+                if key not in seen:
+                    seen.add(key)
+                    hits.append((cid, name))
+        if len(hits) == 1:
+            return hits[0][0], hits[0][1], 1
+        return "", "", len(hits)
+
     def _task_status_from_grid_api(self, want, t_start):
         """Phase-1 fast path: build pass/fail from the ACCUMULATED
         getCaseLoadMainGridData pages if they're fresh AND cover the expected
@@ -3479,6 +3547,105 @@ class BrowserWorker:
         except Exception:
             pass
 
+    def _browser_is_minimized(self) -> bool:
+        """True if the launcher's browser window is currently minimized
+        (iconic). Windows-only; False off Windows / if not locatable.
+        (A minimized window still reports as visible to IsWindowVisible,
+        so _locate_browser_hwnd still finds it.)"""
+        if sys.platform != "win32":
+            return False
+        try:
+            import ctypes
+            hwnd = self._locate_browser_hwnd()
+            return bool(hwnd and ctypes.windll.user32.IsIconic(hwnd))
+        except Exception:
+            return False
+
+    def _restore_browser_window(self) -> None:
+        """Un-minimize the launcher's browser WITHOUT activating it / stealing
+        the cursor — enough to make Lightning render its list-view DOM, which
+        it defers while the window is minimized (document.visibilityState
+        == 'hidden'). SW_SHOWNOACTIVATE restores a minimized window to its
+        prior size/position but leaves the foreground window untouched.
+        Windows-only no-op otherwise."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = self._locate_browser_hwnd()
+            if hwnd and user32.IsWindow(hwnd) and user32.IsIconic(hwnd):
+                SW_SHOWNOACTIVATE = 4
+                user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+        except Exception:
+            pass
+
+    def _wait_page_visible(self, ctx, timeout_ms: int = 6000) -> None:
+        """Block until the active page reports document.visibilityState ==
+        'visible', then a short settle beat. Restoring a minimized window flips
+        visibility asynchronously, and Lightning only (re)renders its deferred
+        list-view DOM once visible — so kicking off a table wait before that
+        flip lands is the cold-start race that made the first archive/caseload
+        export after un-minimizing time out. Best-effort: returns on any error
+        (e.g. no page yet) and lets the caller's own table wait proceed."""
+        try:
+            page = self._active_page(ctx)
+            if page is None:
+                return
+            page.wait_for_function(
+                "() => document.visibilityState === 'visible'",
+                timeout=timeout_ms)
+            # Give Lightning a beat to actually schedule the deferred render
+            # now that the page is visible, before we start waiting on the table.
+            page.wait_for_timeout(400)
+        except Exception:
+            pass
+
+    def _page_visibility_state(self, ctx) -> str:
+        """document.visibilityState of the active page ('visible' | 'hidden'),
+        or '' if unreadable. This — not the Win32 iconic flag — is what gates
+        Lightning's deferred list-view render, so it's the reliable signal for
+        'will the table load right now?'."""
+        try:
+            page = self._active_page(ctx)
+            if page is not None:
+                return page.evaluate("() => document.visibilityState") or ""
+        except Exception:
+            pass
+        return ""
+
+    @contextmanager
+    def _browser_restored_for_dom(self, ctx):
+        """Around any operation that drives the LIVE caseload/list-view DOM
+        (CSV export, outcomes-archive export): if the page can't render right
+        now (minimized → document.visibilityState 'hidden'), un-minimize the
+        browser without stealing focus, wait until it reports visible (see
+        _wait_page_visible), run the operation, then re-minimize. Lightning
+        defers rendering while hidden, so those exports otherwise time out with
+        'caseload table didn't load'. A no-op when already visible / off Windows.
+
+        Decision keys off the page's own visibilityState rather than the Win32
+        iconic flag alone: _locate_browser_hwnd picks among several Chromium
+        top-level windows and prefers a non-iconic one, so the iconic check can
+        miss a genuinely-minimized browser. visibilityState is read straight
+        from the page and has no such ambiguity; the iconic flag is a fallback."""
+        hidden = (self._page_visibility_state(ctx) == "hidden"
+                  or self._browser_is_minimized())
+        if hidden:
+            self.on_status(
+                "  [debug] briefly un-minimizing the browser so its list view "
+                "renders (it stays in the background)…")
+            self._restore_browser_window()
+            self._wait_page_visible(ctx)
+        try:
+            yield
+        finally:
+            if hidden:
+                try:
+                    self._minimize_browser_window()
+                except Exception:
+                    pass
+
     @contextmanager
     def _lean_scan_columns(self, table, target):
         """Hide every datatable column EXCEPT the Student ID column for the
@@ -3590,13 +3757,8 @@ class BrowserWorker:
                     last_error = str(e)
                     continue
             try:
-                tables = (
-                    target.locator("table")
-                    .filter(has=target.locator('th:has-text("Course Code")'))
-                    .filter(has=target.locator('th:has-text("Name")'))
-                )
-                tables.first.wait_for(state="visible", timeout=20_000)
-                return target, tables.first
+                table = self._await_caseload_list(target)
+                return target, table
             except Exception as e:
                 last_error = str(e)
                 continue
@@ -3943,6 +4105,18 @@ class BrowserWorker:
     def _download_caseload_csv(
         self, ctx, save_path: Path,
     ) -> tuple[bool, str]:
+        """Export the caseload CSV, un-minimizing the browser for the duration
+        if needed. The startup auto-refresh and every post-batch refresh reach
+        here after the browser has been minimized, and the Lightning list-view
+        DOM doesn't render while minimized — so without _browser_restored_for_dom
+        the table never loads and the refresh times out with 'caseload table
+        didn't load' (leaving the app on a stale cached CSV)."""
+        with self._browser_restored_for_dom(ctx):
+            return self._download_caseload_csv_impl(ctx, save_path)
+
+    def _download_caseload_csv_impl(
+        self, ctx, save_path: Path,
+    ) -> tuple[bool, str]:
         """Click WGU's custom Download button on the Caseload list
         view and save the resulting CSV to `save_path`. Returns
         (success, message).
@@ -4068,6 +4242,18 @@ class BrowserWorker:
         return True, f"saved to {Path(save_path).name}"
 
     def _download_outcomes_archive(
+        self, ctx, save_path: Path,
+    ) -> tuple[bool, str]:
+        """Export the outcomes archive, un-minimizing the browser for the
+        duration if needed. The export drives the real Lightning list-view DOM,
+        which doesn't render while the window is minimized; startup and the
+        manual '⤓ Update archive' button both reach here after the browser has
+        been minimized, so without _browser_restored_for_dom the table never
+        loads and the export times out with 'caseload table didn't load'."""
+        with self._browser_restored_for_dom(ctx):
+            return self._download_outcomes_archive_impl(ctx, save_path)
+
+    def _download_outcomes_archive_impl(
         self, ctx, save_path: Path,
     ) -> tuple[bool, str]:
         """Switch the caseload list-view picker to 'Archive (Last 30 Days)',

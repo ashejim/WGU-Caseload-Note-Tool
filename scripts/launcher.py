@@ -17029,18 +17029,49 @@ class App:
                     self._splash_step("Reading Essential Actions…", 0.45)
                     self.worker.submit_read_ea_dashboard(on_ea_done)
                 else:
-                    self._append_log(
-                        "Caseload not loaded yet — if you're not signed in to "
-                        "Salesforce, sign in in the browser window, then click "
-                        "↻ Caseload. (Until then, batches fall back to a slower "
-                        "per-student scrape.)"
-                    )
-                    self._set_idle()
+                    # Cold-start race: the browser is "ready" (page loaded) well
+                    # before Salesforce's Caseload Lightning app finishes its
+                    # first render (SSO redirect chain + getCaseLoadMainGridData
+                    # Aura call), so the initial table wait times out even though
+                    # a manual ↻ Caseload a few seconds later loads instantly.
+                    # Retry once automatically after a warm-up delay rather than
+                    # making the user click ↻ Caseload on every launch. The
+                    # message also covers the genuinely-not-signed-in case so the
+                    # user isn't left waiting blind either way.
+                    tries = getattr(self, "_startup_caseload_tries", 1)
+                    if tries < 2 and self.worker.ready_event.is_set():
+                        self._startup_caseload_tries = tries + 1
+                        self._append_log(
+                            "Caseload didn't load yet — Salesforce may still be "
+                            "warming up (SSO + list-view render). Retrying "
+                            "automatically in 10s… If you're not signed in, sign "
+                            "in in the browser window now.")
+                        self._set_idle()   # don't block the user during the wait
+                        self.root.after(10000, _retry_startup_caseload)
+                    else:
+                        self._append_log(
+                            "Caseload not loaded yet — if you're not signed in to "
+                            "Salesforce, sign in in the browser window, then click "
+                            "↻ Caseload. (Until then, batches fall back to a slower "
+                            "per-student scrape.)"
+                        )
+                        self._set_idle()
             try:
                 self.root.after(0, set_main)
             except Exception:
                 pass
 
+        def _retry_startup_caseload() -> None:
+            # Skip if the user has started something (the download would conflict)
+            # or the browser went away — in those cases ↻ Caseload is theirs to
+            # press. Otherwise re-run the same load through the same on_done.
+            if getattr(self, "_is_busy", False) or not self.worker.ready_event.is_set():
+                return
+            self._set_busy("Auto-refreshing caseload…")
+            self._append_log("Retrying caseload load…")
+            self.worker.submit_download_caseload_csv(CASELOAD_CSV_PATH, on_done)
+
+        self._startup_caseload_tries = 1
         self.worker.submit_download_caseload_csv(CASELOAD_CSV_PATH, on_done)
 
     def _open_panel_actions_dialog(self, parent=None) -> None:
