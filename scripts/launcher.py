@@ -22347,6 +22347,28 @@ class App:
                         notes = res.get("notes") or []
                         panel.show_notes(label, notes)
                         panel._hide_load_all_btn()   # full set now shown
+                        # Phase 1a (persist-on-view): stash this FULL, all-author
+                        # thread — the only note path carrying inbound student
+                        # messages — so inbound texts + real contact timing
+                        # accumulate for analysis (history.notes). contact_id is
+                        # reliable; student_id is best-effort from a numeric query.
+                        try:
+                            _sid = (str(query).strip()
+                                    if str(query or "").strip().isdigit() else "")
+                            _pr = history.persist_notes(
+                                notes, student_id=_sid, contact_id=cid)
+                            if _pr.get("error"):
+                                self._append_log(
+                                    f"  ↳ contact history: not stored "
+                                    f"({_pr['error']})", error=True)
+                            elif _pr.get("inserted") or _pr.get("updated"):
+                                self._append_log(
+                                    f"  ↳ contact history: +{_pr.get('inserted', 0)} "
+                                    f"new, {_pr.get('updated', 0)} updated "
+                                    f"({history.notes_count()} total).")
+                        except Exception as _e:
+                            self._append_log(
+                                f"  ↳ contact history error: {_e}", error=True)
                         if notes:
                             self._append_log(
                                 f"Notes for {label}: {len(notes)} loaded "

@@ -179,6 +179,35 @@ CREATE TABLE IF NOT EXISTS outcomes (
     PRIMARY KEY (student_id, course_code)
 );
 CREATE INDEX IF NOT EXISTS ix_outcomes_course ON outcomes(course_code);
+
+-- Per-student contact NOTES scraped from the SF Notes History tab. One row per
+-- SF note record (note_id = the note's Salesforce record id, parsed from its
+-- anchor href). SF notes are editable but never deleted, so re-scraping UPSERTS
+-- (first_seen_at preserved; body/type/direction refreshed). Captures the REAL
+-- event time (WGUCreationDateTime__c) plus derived channel + direction, so
+-- inbound texts and true contact timing become analyzable — the thing daily
+-- snapshots can't hold (they keep only the latest note). See
+-- data_analysis/FINDINGS.md §6. contact_id is always reliable; student_id is
+-- best-effort (join contact_id -> snapshots.extra_json.contactID to backfill).
+CREATE TABLE IF NOT EXISTS notes (
+    note_id       TEXT PRIMARY KEY,
+    student_id    TEXT,
+    contact_id    TEXT,
+    course_code   TEXT,
+    type          TEXT,        -- SF Type__c, e.g. 'Instant Message (IM) / Text'
+    channel       TEXT,        -- derived: text / email / note / chatter / other
+    direction     TEXT,        -- derived: inbound / outbound / '' (unknown)
+    created_at    TEXT,        -- WGUCreationDateTime__c (the real event time)
+    author        TEXT,
+    subject       TEXT,
+    body          TEXT,
+    url           TEXT,
+    first_seen_at TEXT,        -- when we first scraped this note
+    last_seen_at  TEXT         -- most recent scrape (notes can be edited)
+);
+CREATE INDEX IF NOT EXISTS ix_notes_student ON notes(student_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_notes_contact ON notes(contact_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_notes_channel ON notes(channel, direction);
 """
 
 
@@ -482,6 +511,183 @@ def backfill_missing_names(*, db_path=HISTORY_DB) -> int:
                     )
                     updated += cur.rowcount
             return updated
+    finally:
+        conn.close()
+
+
+# ----------------------------------------------------------------------
+# contact notes (scraped SF Notes History) — Phase 1a: persist-on-view
+# ----------------------------------------------------------------------
+def note_id_from_url(url: str) -> str:
+    """The Salesforce record id embedded in a note's anchor href, if any. Handles
+    both the classic '.../a16S600000nIdA3IAK' tail and the Lightning
+    '.../r/ShortText__c/a16S…AY/view' mid-path form by scanning every path/query
+    segment for the one that looks like an SF id (15 or 18 alphanumerics). '' if
+    none — the href is often empty here (the cell anchor sits in a shadow root)."""
+    if not url:
+        return ""
+    for seg in str(url).replace("?", "/").replace("&", "/").split("/"):
+        if len(seg) in (15, 18) and seg.isalnum():
+            return seg
+    return ""
+
+
+def _synthetic_note_id(vals: dict) -> str:
+    """Stable content-hash id for a note whose SF record id we couldn't parse
+    (empty/opaque href). Keyed on the student + event time + subject + body head,
+    which uniquely identifies a note within a student's thread. An EDIT to the
+    body yields a new id (can't detect the edit) — acceptable; a parsed record id
+    (when present) gives true edit-upsert instead."""
+    import hashlib
+    raw = "|".join((
+        vals.get("contact_id", "") or vals.get("student_id", ""),
+        vals.get("created_at", ""), vals.get("subject", ""),
+        (vals.get("body", "") or "")[:80],
+    ))
+    return "syn:" + hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:16]
+
+
+def classify_note_channel(note_type: str) -> str:
+    """Map an SF Type__c to a coarse channel: text / email / call / chatter / note."""
+    t = (note_type or "").lower()
+    if "text" in t or "instant message" in t or "(im)" in t:
+        return "text"
+    if "email" in t:
+        return "email"
+    if "call" in t or "phone" in t:
+        return "call"
+    if "chatter" in t:
+        return "chatter"
+    return "note" if t else "other"
+
+
+def classify_note_direction(note_type: str, body: str) -> str:
+    """inbound / outbound / '' for one note.
+
+    Reliable inbound signals: an 'Email from Student' type, or a text body whose
+    first direction marker is 'Incoming:' (Mongoose writes Incoming:/Outgoing:).
+    Everything email — 'to Student', welcome, Mass Email, cohort invites — defaults
+    OUTBOUND (a genuine student email is always typed 'from Student', so an
+    unmarked email is one we sent). Unprefixed texts / calls / admin notes stay ''
+    (unknown): the multi-sender text-export format needs richer parsing (Phase 1c)."""
+    t = (note_type or "").lower()
+    if "from student" in t:
+        return "inbound"
+    b = (body or "").lower()
+    i, o = b.find("incoming:"), b.find("outgoing:")
+    if i != -1 and (o == -1 or i < o):
+        return "inbound"
+    if o != -1:
+        return "outbound"
+    if "email" in t or "welcome" in t:   # unmarked email = we sent it
+        return "outbound"
+    return ""
+
+
+def reclassify_notes(*, db_path=HISTORY_DB) -> int:
+    """Recompute channel + direction for every stored note from its (type, body)
+    — cheap, idempotent, no re-scrape. Run after the classifiers change. Returns
+    the number of rows whose channel or direction actually moved."""
+    conn = _connect(db_path)
+    try:
+        changed = 0
+        with conn:
+            for r in conn.execute(
+                    "SELECT note_id, type, body, channel, direction FROM notes"):
+                ch = classify_note_channel(r["type"])
+                di = classify_note_direction(r["type"], r["body"])
+                if ch != r["channel"] or di != r["direction"]:
+                    conn.execute(
+                        "UPDATE notes SET channel = ?, direction = ? "
+                        "WHERE note_id = ?", (ch, di, r["note_id"]))
+                    changed += 1
+        return changed
+    finally:
+        conn.close()
+
+
+def persist_notes(notes, *, student_id: str = "", contact_id: str = "",
+                  course_code: str = "", db_path=HISTORY_DB,
+                  now: Optional[datetime] = None) -> dict:
+    """Upsert scraped SF note-history rows into the ``notes`` table.
+
+    ``notes`` is the list of dicts the browser scrape returns (keys: type,
+    course, subject, text, author, date, url). Each row is keyed by its SF note
+    record id (parsed from the anchor url); notes are editable-but-never-deleted,
+    so a re-scrape UPSERTS — first_seen_at is preserved, the mutable fields and
+    last_seen_at refresh. Rows without a usable note id are skipped (can't dedup).
+    Never raises; returns {'inserted', 'updated', 'skipped'} (or an error dict)."""
+    try:
+        now_iso = (now or datetime.now()).isoformat(timespec="seconds")
+        ins = upd = skip = 0
+        conn = _connect(db_path)
+        try:
+            with conn:
+                for nd in notes or []:
+                    body = nd.get("text") or ""
+                    ntype = nd.get("type") or ""
+                    vals = {
+                        "student_id": student_id or "",
+                        "contact_id": contact_id or "",
+                        "course_code": nd.get("course") or course_code or "",
+                        "type": ntype,
+                        "channel": classify_note_channel(ntype),
+                        "direction": classify_note_direction(ntype, body),
+                        "created_at": nd.get("date") or "",
+                        "author": nd.get("author") or "",
+                        "subject": nd.get("subject") or "",
+                        "body": body,
+                        "url": nd.get("url") or "",
+                    }
+                    # Prefer the real SF record id (true edit-upsert); fall back to
+                    # a content hash when the href carries no id (common — the
+                    # anchor is in a shadow root), so a note is never dropped.
+                    nid = note_id_from_url(vals["url"]) or _synthetic_note_id(vals)
+                    if not nid or not (vals["created_at"] or body):
+                        skip += 1        # nothing to identify or store
+                        continue
+                    exists = conn.execute(
+                        "SELECT 1 FROM notes WHERE note_id = ?", (nid,)).fetchone()
+                    if exists:
+                        # Don't blank a known student_id/contact_id if this scrape
+                        # didn't carry one (COALESCE(NULLIF(...))).
+                        conn.execute(
+                            "UPDATE notes SET "
+                            "student_id = COALESCE(NULLIF(?,''), student_id), "
+                            "contact_id = COALESCE(NULLIF(?,''), contact_id), "
+                            "course_code = ?, type = ?, channel = ?, direction = ?, "
+                            "created_at = ?, author = ?, subject = ?, body = ?, "
+                            "url = ?, last_seen_at = ? WHERE note_id = ?",
+                            (vals["student_id"], vals["contact_id"],
+                             vals["course_code"], vals["type"], vals["channel"],
+                             vals["direction"], vals["created_at"], vals["author"],
+                             vals["subject"], vals["body"], vals["url"],
+                             now_iso, nid))
+                        upd += 1
+                    else:
+                        conn.execute(
+                            "INSERT INTO notes (note_id, student_id, contact_id, "
+                            "course_code, type, channel, direction, created_at, "
+                            "author, subject, body, url, first_seen_at, "
+                            "last_seen_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (nid, vals["student_id"], vals["contact_id"],
+                             vals["course_code"], vals["type"], vals["channel"],
+                             vals["direction"], vals["created_at"], vals["author"],
+                             vals["subject"], vals["body"], vals["url"],
+                             now_iso, now_iso))
+                        ins += 1
+        finally:
+            conn.close()
+        return {"inserted": ins, "updated": upd, "skipped": skip}
+    except Exception as e:  # never break the notes-view render
+        return {"status": "error", "error": str(e)}
+
+
+def notes_count(*, db_path=HISTORY_DB) -> int:
+    """Total stored contact-note rows (Phase 1a accumulator size)."""
+    conn = _connect(db_path)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
     finally:
         conn.close()
 
