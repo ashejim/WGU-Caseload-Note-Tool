@@ -21105,9 +21105,18 @@ class App:
 
     def _merge_grid_and_csv_rows(self, built, csv_rows):
         """JSON-primary caseload rows with CSV-only columns overlaid: the live
-        grid is the roster, the CSV fills any column the grid lacks (follow-up,
-        nursing dates). No student is dropped from either source. Matched by
-        (StudentID, CourseCode)."""
+        grid is the AUTHORITATIVE roster, the CSV only fills columns the grid
+        lacks (follow-up, nursing dates). Matched by (StudentID, CourseCode).
+
+        A student in the CSV but ABSENT from the grid has dropped off the live
+        caseload — WGU removes passers from the feed (see passers-drop-off). This
+        merge runs only when the grid feed is healthy (the caller gates on
+        _grid_feed_health), so a grid-missed CSV row is a departure, NOT a
+        coverage gap. It's left OFF the live list (still preserved in history and
+        reachable via 🗄 Archived) rather than re-injected as a name-less,
+        status-less ghost — which is exactly what a slimmed list view (no Name
+        column) used to produce. Dropped keys land on self._grid_dropped_csv_only
+        for the caller to log."""
         def _k(sid, course):
             return (str(sid or "").strip(), str(course or "").strip())
 
@@ -21133,16 +21142,18 @@ class App:
                     if col not in j:          # overlay only CSV-only columns
                         j[col] = val
             result.append(j)
-        for r in csv_rows:                    # keep CSV students the grid missed
+        # CSV students the healthy grid didn't list = departed (passed / off
+        # caseload). Record them for the caller's log, but DON'T re-inject them
+        # into the live list (they'd have no name/status — the grid is the only
+        # source of those and it dropped them).
+        dropped = []
+        for r in csv_rows:
             ck = ckey(r)
-            # A CSV row with no StudentID can't be identified (e.g. the view
-            # dropped the Student ID column) — it's already represented by the
-            # grid, so appending it would just duplicate every row with a blank
-            # id. Skip it; the grid is the roster.
-            if not ck[0]:
+            if not ck[0]:                     # unkeyable CSV row → already covered
                 continue
             if ck not in seen_sc and ck[0] not in seen_sid:
-                result.append(r)
+                dropped.append(ck)
+        self._grid_dropped_csv_only = dropped
         return result
 
     def _reload_caseload_cache(self, *, silent: bool = False) -> bool:
@@ -21172,6 +21183,7 @@ class App:
         # from it (complete regardless of the SF view config) and overlay any
         # CSV-only columns from the CSV. Any doubt → keep the CSV rows.
         source = CASELOAD_CSV_PATH.name
+        self._grid_dropped_csv_only = []
         if getattr(self.settings, "caseload_source_json", True):
             try:
                 health = self._grid_feed_health(rows)
@@ -21203,6 +21215,13 @@ class App:
                 f"✓ Caseload loaded: {len(rows)} students from {source} ({age})",
                 success=True,
             )
+            dropped = getattr(self, "_grid_dropped_csv_only", None)
+            if dropped:
+                self._append_log(
+                    f"  ↳ {len(dropped)} student(s) in the CSV but not the live "
+                    "grid were treated as departed (passed / off-caseload) and "
+                    "left off the live list — find them in 🗄 Archived."
+                )
             if not self._csv_has_student_email:
                 self._append_log(
                     "  ↳  no student-email column detected — batch "

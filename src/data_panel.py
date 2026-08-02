@@ -819,14 +819,14 @@ class DataPanel:
     # anchor. 'momentum' sorts by rank, not the label text (see _ar_sort_by).
     _AR_COLS = [
         ("momentum", "Momentum", 80, "center"),
+        ("trend", "Trend", 48, "center"),
         ("name", "Student", 150, "w"),
         ("student_id", "ID", 80, "center"),
         ("course_code", "Course", 58, "center"),
         ("task_status", "Last task", 112, "w"),
-        ("days_since_task", "dTask", 50, "center"),
+        ("days_into_course", "Days in", 56, "center"),
         ("days_since_contact", "dContact", 64, "center"),
         ("term_days_left", "Term left", 66, "center"),
-        ("other_courses", "Others", 54, "center"),
         ("ic_end", "IC ext", 86, "center"),
     ]
 
@@ -858,12 +858,13 @@ class DataPanel:
         self._ar_fill(rows)
         low = sum(1 for r in rows if r["momentum_rank"] == 1)
         self.status.configure(text=(
-            f"{len(rows)} at-risk students on the current caseload "
-            f"(Low {low}, Med-Low {len(rows) - low}), still in progress. "
-            "Sorted by urgency (term days left, then days stalled). Click a "
-            "header to re-sort; double-click a row to copy the Student ID. "
-            "Note ~67% of Low students still pass — a focus list, not a "
-            "verdict; Momentum can lag recent task progress (watch dTask)."))
+            f"{len(rows)} genuinely stuck-low students (Low {low}, Med-Low "
+            f"{len(rows) - low}). Filtered to the real risk: momentum never "
+            "recovered, last task not yet passed, course underway, and no other "
+            "course to finish first (jugglers pass ~81% and are excluded; "
+            "sole-focus low students pass only ~50%). Sorted by urgency (term "
+            "days left, then days into course). Click a header to re-sort; "
+            "double-click a row to copy the Student ID."))
 
     def _ar_fill(self, rows) -> None:
         t = self._ar_tree
@@ -874,11 +875,11 @@ class DataPanel:
             tag = "low" if r["momentum_rank"] == 1 else "medlow"
             t.insert("", "end",
                      iid=f"{r['student_id']}|{r['course_code']}",
-                     values=(r["momentum"], r["name"], r["student_id"],
-                             r["course_code"], r["task_status"],
-                             sv(r["days_since_task"]), sv(r["days_since_contact"]),
-                             sv(r["term_days_left"]), sv(r["other_courses"]),
-                             r["ic_end"] or "—"),
+                     values=(r["momentum"], r.get("trend", ""), r["name"],
+                             r["student_id"], r["course_code"], r["task_status"],
+                             sv(r.get("days_into_course")),
+                             sv(r["days_since_contact"]),
+                             sv(r["term_days_left"]), r["ic_end"] or "—"),
                      tags=(tag,))
 
     def _ar_sort_by(self, key) -> None:

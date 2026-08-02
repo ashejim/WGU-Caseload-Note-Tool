@@ -56,6 +56,9 @@ history.db*
 caseload_history.csv
 # Local per-student Success Path state (field values + step log) — PII, FERPA.
 success_path.db*
+# Local data-analysis notes — contain real student names/IDs + performance
+# figures. PII/FERPA + personal; never commit to the public repo.
+data_analysis/
 # Mongoose contacts/segment exports (Contact ids + names + mobiles) — PII.
 # These can be named anything (e.g. "all C769 students-cfad.csv"), so the
 # narrow patterns below aren't enough on their own.

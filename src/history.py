@@ -408,6 +408,25 @@ def record_snapshot(rows, csv_mtime, *, interval_hours: int = 24,
                 if partial:
                     departures = []  # truncated export — not real attrition
 
+                # Carry forward the last-known name for any row whose export
+                # dropped the Name column (a slimmed list view, or a grid-missed
+                # row): writing a blank name would erase a known student's
+                # identity from history and from the Departures/Archived views.
+                name_cache: dict = {}
+                for rec in records:
+                    if (rec.get("name") or "").strip():
+                        continue
+                    key = (rec["student_id"], rec["course_code"])
+                    if key not in name_cache:
+                        prior = cur.execute(
+                            "SELECT name FROM snapshots WHERE student_id = ? "
+                            "AND course_code = ? AND name != '' "
+                            "ORDER BY collected_at DESC LIMIT 1", key,
+                        ).fetchone()
+                        name_cache[key] = prior["name"] if prior else ""
+                    if name_cache[key]:
+                        rec["name"] = name_cache[key]
+
                 cur.execute(
                     "INSERT INTO collections"
                     "(collected_at, collected_date, bucket, csv_mtime, "
@@ -433,6 +452,38 @@ def record_snapshot(rows, csv_mtime, *, interval_hours: int = 24,
         }
     except Exception as e:  # never break the reload path
         return {"status": "error", "error": str(e)}
+
+
+def backfill_missing_names(*, db_path=HISTORY_DB) -> int:
+    """One-time cleanup: fill any blank ``name`` in ``snapshots`` from that same
+    student's most recent non-blank name (e.g. rows captured while a slimmed list
+    view dropped the Name column). Returns the number of rows updated. Safe to
+    re-run — it only touches rows whose name is still blank."""
+    conn = _connect(db_path)
+    try:
+        with conn:
+            blanks = conn.execute(
+                "SELECT DISTINCT student_id, course_code FROM snapshots "
+                "WHERE name = ''"
+            ).fetchall()
+            updated = 0
+            for b in blanks:
+                key = (b["student_id"], b["course_code"])
+                prior = conn.execute(
+                    "SELECT name FROM snapshots WHERE student_id = ? "
+                    "AND course_code = ? AND name != '' "
+                    "ORDER BY collected_at DESC LIMIT 1", key,
+                ).fetchone()
+                if prior and prior["name"]:
+                    cur = conn.execute(
+                        "UPDATE snapshots SET name = ? WHERE student_id = ? "
+                        "AND course_code = ? AND name = ''",
+                        (prior["name"], key[0], key[1]),
+                    )
+                    updated += cur.rowcount
+            return updated
+    finally:
+        conn.close()
 
 
 def _departures_vs_prior_day(cur: sqlite3.Cursor, today: str,
@@ -902,15 +953,36 @@ def _to_int(x):
         return None
 
 
-def at_risk_students(*, db_path=HISTORY_DB, ranks=(1, 2)) -> list[dict]:
-    """Current-caseload students the Momentum model flags at-risk (Low / Med-Low
-    by default), still in progress, with triage fields for a sortable table.
+def at_risk_students(*, db_path=HISTORY_DB, ranks=(1, 2), strict=True,
+                     now: Optional[datetime] = None) -> list[dict]:
+    """Current-caseload students genuinely stuck at low Momentum.
 
-    Reads the latest snapshot (the live caseload) and excludes any student who
-    already has a resolved outcome. Sorted by urgency: fewest term-days-left
-    first, then most days stalled on a task. Each row carries the fields an
-    instructor triages on (days since last task / contact, term days left,
-    number of other courses, IC extension date)."""
+    In ``strict`` mode (default) applies the four empirically-validated gates
+    from data_analysis/FINDINGS.md §5, each of which removed a distinct block of
+    false positives from the naive "everyone currently Low/Med-Low" list:
+
+      1. **never recovered** — rank in ``ranks`` (Low/Med-Low) now AND the
+         student's MAX rank across their whole snapshot history is still ≤ 2
+         (recovery is the real split: recovered low → 86% pass vs stayed-low 69%);
+      2. **task not already 'Passed'** — Momentum lags task progress, so a Low
+         reading on a student who already cleared their task is stale, not risk;
+      3. **course underway** — ``CourseStatus`` is not 'Planned' AND
+         ``CourseStartDate`` is in the past. 'Planned' means enrolled-but-not-
+         begun (every such row has weeksincourse 0), and a future/absent start
+         date likewise means not begun — a low reading before the student has
+         started is meaningless (and future starts are a known dirty field);
+      4. **no other active course** — ``count_other_courses(OtherCourses) == 0``;
+         a juggler is low only because they're finishing earlier courses first
+         (they still pass ~81%). Only sole-focus low students are a real ~50% risk.
+
+    ``strict=False`` reverts to the legacy behaviour (rank + not-resolved only).
+
+    Reads the live caseload (latest snapshot) plus each student's momentum history
+    (for the recovery gate + trend). Excludes anyone already resolved in outcomes.
+    Sorted by urgency: fewest term-days-left first, then most days into the course.
+    Rows carry the instructor's triage fields plus ``entry_rank``, ``max_rank``,
+    ``trend`` (▲/▬/▼), and ``days_into_course`` (days since the course started)."""
+    today = (now or datetime.now()).date()
     conn = _connect(db_path)
     try:
         latest = conn.execute("SELECT collected_at FROM collections "
@@ -921,6 +993,14 @@ def at_risk_students(*, db_path=HISTORY_DB, ranks=(1, 2)) -> list[dict]:
                             (latest["collected_at"],)).fetchall()
         resolved = {(r["student_id"], r["course_code"]) for r in
                     conn.execute("SELECT student_id, course_code FROM outcomes")}
+        # Per-student momentum history (chronological) for the recovery gate +
+        # entry reading + trend — one pass over the whole snapshots table.
+        hist: dict = {}
+        for h in conn.execute("SELECT student_id, course_code, momentum_rank "
+                              "FROM snapshots ORDER BY collected_at ASC"):
+            if h["momentum_rank"] is not None:
+                hist.setdefault((h["student_id"], h["course_code"]), []).append(
+                    h["momentum_rank"])
     finally:
         conn.close()
 
@@ -935,23 +1015,49 @@ def at_risk_students(*, db_path=HISTORY_DB, ranks=(1, 2)) -> list[dict]:
             e = json.loads(r["extra_json"] or "{}")
         except Exception:
             e = {}
+        past = hist.get(key, [])
+        entry_rank = past[0] if past else r["momentum_rank"]
+        max_rank = max(past) if past else r["momentum_rank"]
+        task_status = r["latest_task_status"] or ""
+        others = count_other_courses(_ej_get(e, "OtherCourses"), r["course_code"])
+        start = _parse_date(_ej_get(e, "CourseStartDate"))
+        days_into = (today - start).days if start else None
+        status = _ej_get(e, "CourseStatus")
+
+        if strict:
+            if max_rank > 2:                       # gate 1: recovered at some point
+                continue
+            if task_status.strip() == "Passed":    # gate 2: already passed a task
+                continue
+            # gate 3: course genuinely underway (not 'Planned', start in the past)
+            if status == "Planned" or days_into is None or days_into <= 0:
+                continue
+            if others != 0:                        # gate 4: juggling other courses
+                continue
+
+        cur = r["momentum_rank"]
+        trend = "▬" if cur == entry_rank else (
+            "▲" if cur > entry_rank else "▼")
         out.append({
-            "momentum_rank": r["momentum_rank"],
+            "momentum_rank": cur,
             "momentum": r["momentum"] or "",
             "name": r["name"] or "",
             "student_id": r["student_id"],
             "course_code": r["course_code"],
-            "task_status": r["latest_task_status"] or "",
+            "task_status": task_status,
+            "entry_rank": entry_rank,
+            "max_rank": max_rank,
+            "trend": trend,
+            "days_into_course": days_into,
             "days_since_task": _to_int(_ej_get(e, "NumberOfDaysSinceLastTaskDate")),
             "days_since_contact": _to_int(_ej_get(e, "DaysSinceLastCourseContact")),
             "term_days_left": _to_int(_ej_get(e, "TermDaysLeft")),
-            "other_courses": count_other_courses(_ej_get(e, "OtherCourses"),
-                                                 r["course_code"]),
+            "other_courses": others,
             "ic_end": _ej_get(e, "Icenddate"),
         })
     out.sort(key=lambda a: (
         a["term_days_left"] if a["term_days_left"] is not None else 1 << 30,
-        -(a["days_since_task"] or 0)))
+        -(a["days_into_course"] or 0)))
     return out
 
 
