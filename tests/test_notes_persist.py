@@ -137,6 +137,32 @@ def test_persist_skips_empty_note():
         os.unlink(db)
 
 
+def test_sweep_change_gate():
+    db = _tmp_db()
+    try:
+        # We already have a note for contact 'A' dated 2026-07-01.
+        history.persist_notes(
+            [_note(url="", date="2026-07-01T10:00:00.000Z")],
+            contact_id="A", db_path=db)
+        assert history.notes_last_stored(db_path=db) == {
+            "A": "2026-07-01T10:00:00.000Z"}
+
+        students = [
+            {"contact_id": "A", "last_contact": "2026-06-01T00:00:00Z"},   # older
+            {"contact_id": "A", "last_contact": "2026-07-15T00:00:00Z"},   # newer
+            {"contact_id": "B", "last_contact": "2026-08-01T00:00:00Z"},   # unseen
+            {"contact_id": "", "last_contact": "2026-08-01T00:00:00Z"},    # no id
+        ]
+        need = history.students_needing_note_sweep(students, db_path=db)
+        got = [(s["contact_id"], s["last_contact"]) for s in need]
+        # 'A' with an OLDER contact is skipped; the rest are included.
+        assert got == [("A", "2026-07-15T00:00:00Z"),
+                       ("B", "2026-08-01T00:00:00Z"),
+                       ("", "2026-08-01T00:00:00Z")], got
+    finally:
+        os.unlink(db)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

@@ -692,6 +692,43 @@ def notes_count(*, db_path=HISTORY_DB) -> int:
         conn.close()
 
 
+def notes_last_stored(*, db_path=HISTORY_DB) -> dict:
+    """{contact_id -> newest stored note created_at (ISO str)} — the high-water
+    mark per student, used to change-gate the sweep (Phase 1b)."""
+    conn = _connect(db_path)
+    try:
+        return {r["contact_id"]: r["newest"] for r in conn.execute(
+            "SELECT contact_id, MAX(created_at) AS newest FROM notes "
+            "WHERE contact_id != '' GROUP BY contact_id") if r["newest"]}
+    finally:
+        conn.close()
+
+
+def students_needing_note_sweep(students, *, db_path=HISTORY_DB,
+                                _stored=None) -> list:
+    """Change-gate a note sweep: from ``students`` (dicts with at least
+    ``contact_id`` and ``last_contact`` — the newest caseload contact timestamp,
+    ISO), keep only those whose last contact is NEWER than the newest note we've
+    already stored for them (or who have no stored notes / no contact id). ISO
+    timestamps compare correctly as strings. This makes a repeat sweep cheap —
+    only students actually contacted since the last sweep are re-scraped.
+
+    ``_stored`` (a pre-fetched notes_last_stored dict) is a seam for tests / to
+    avoid re-querying when the caller already has it."""
+    stored = notes_last_stored(db_path=db_path) if _stored is None else _stored
+    out = []
+    for s in students:
+        cid = (s.get("contact_id") or "").strip()
+        if not cid:
+            out.append(s)            # can't gate without an id — best-effort include
+            continue
+        newest = stored.get(cid)
+        last_contact = (s.get("last_contact") or "").strip()
+        if newest is None or (last_contact and last_contact > newest):
+            out.append(s)
+    return out
+
+
 def _departures_vs_prior_day(cur: sqlite3.Cursor, today: str,
                              incoming_keys: set):
     """(departures, prior_row_count) comparing the most recent collection from

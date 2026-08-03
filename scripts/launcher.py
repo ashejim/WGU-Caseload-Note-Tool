@@ -6042,6 +6042,17 @@ class CaseloadPanel:
         if q.lower().startswith("textapi"):
             self.app._arm_text_capture()
             return "break"
+        # Phase 1b: "sweepnotes:" scrapes the caseload's note threads into the
+        # local contact-history DB (change-gated — only students contacted since
+        # the last sweep). "sweepnotes: cancel" stops; "sweepnotes: force"
+        # re-scrapes everyone. Drives the browser — best run while away.
+        if q.lower().startswith("sweepnotes"):
+            rest = q.split(":", 1)[1].strip().lower() if ":" in q else ""
+            if rest == "cancel":
+                self.app._cancel_note_sweep()
+            else:
+                self.app._sweep_note_history(force=(rest == "force"))
+            return "break"
         # DIAGNOSTIC: "griddiff:" compares the intercepted grid JSON against the
         # CSV column by column (writes griddiff_report.txt) — proves whether the
         # JSON can replace the CSV before switching the data path. Read-only.
@@ -22413,6 +22424,122 @@ class App:
             except Exception:
                 cid = ""
         self.worker.submit_fetch_notes(query, on_done, contact_id=cid)
+
+    # ---- Phase 1b: incremental note-history sweep -----------------------
+    # Chained ONE student at a time (not a 200-item queue dump) so your live
+    # actions interleave between scrapes; change-gated so a repeat sweep only
+    # re-scrapes students contacted since last time. Drives the browser, so it's
+    # a deliberate, cancellable action ('sweepnotes:' / 'sweepnotes: cancel').
+    _NOTE_SWEEP_THROTTLE_MS = 900
+
+    def _contact_id_for(self, sid) -> str:
+        """Best-effort Contact id for a Student id (segment/grid map, then the
+        complete grid Student->Contact map)."""
+        sid = str(sid or "").strip()
+        if not sid:
+            return ""
+        cid = (self._contact_ids.get(sid, "") or "").strip()
+        if not cid:
+            try:
+                cid = (self.worker.grid_student_contact_map().get(
+                    sid, "") or "").strip()
+            except Exception:
+                cid = ""
+        return cid
+
+    def _sweep_note_history(self, *, force: bool = False) -> None:
+        """Scrape the caseload's note threads into history.notes. `force` skips
+        the change-gate (re-scrape everyone)."""
+        if getattr(self, "_note_sweep_active", False):
+            self._append_log("Note sweep already running — type "
+                             "'sweepnotes: cancel' to stop.")
+            return
+        rows = self._caseload_rows or []
+        if not rows:
+            self._append_log("Note sweep: no caseload loaded.", error=True)
+            return
+        students, seen = [], set()
+        for r in rows:
+            sid = (r.get("StudentID") or "").strip()
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            last_contact = max((r.get("CourseContact") or "").strip(),
+                               (r.get("LastSMContact") or "").strip())
+            students.append({
+                "student_id": sid, "contact_id": self._contact_id_for(sid),
+                "name": (r.get("Name") or sid), "last_contact": last_contact})
+        worklist = (students if force
+                    else history.students_needing_note_sweep(students))
+        if not worklist:
+            self._append_log(f"Note sweep: all {len(students)} students already "
+                             "current — nothing to scrape.")
+            return
+        self._note_sweep_active = True
+        self._note_sweep_cancel = False
+        self._note_sweep_queue = worklist
+        self._note_sweep_total = len(worklist)
+        self._note_sweep_stats = {"done": 0, "stored": 0, "errors": 0}
+        self._append_log(
+            f"▶ Note sweep started: {len(worklist)} of {len(students)} students "
+            "need scraping (change-gated). This drives the browser — best run "
+            "while away. Type 'sweepnotes: cancel' to stop.")
+        self._sweep_next_student()
+
+    def _sweep_next_student(self) -> None:
+        if getattr(self, "_note_sweep_cancel", False) or not getattr(
+                self, "_note_sweep_queue", None):
+            st = getattr(self, "_note_sweep_stats", {}) or {}
+            stopped = ("cancelled" if getattr(self, "_note_sweep_cancel", False)
+                       else "finished")
+            errs = st.get("errors", 0)
+            self._append_log(
+                f"■ Note sweep {stopped}: {st.get('done', 0)}/"
+                f"{getattr(self, '_note_sweep_total', 0)} students, "
+                f"+{st.get('stored', 0)} new notes ({history.notes_count()} "
+                f"total)" + (f", {errs} error(s)" if errs else "") + ".",
+                success=(stopped == "finished"))
+            self._note_sweep_active = False
+            self._note_sweep_queue = []
+            return
+        s = self._note_sweep_queue.pop(0)
+
+        def on_done(res):
+            def after():
+                try:
+                    if res and not res.get("error"):
+                        pr = history.persist_notes(
+                            res.get("notes") or [], student_id=s["student_id"],
+                            contact_id=s["contact_id"])
+                        self._note_sweep_stats["stored"] += pr.get("inserted", 0)
+                    else:
+                        self._note_sweep_stats["errors"] += 1
+                except Exception:
+                    self._note_sweep_stats["errors"] += 1
+                self._note_sweep_stats["done"] += 1
+                d = self._note_sweep_stats["done"]
+                if d % 10 == 0 or d == self._note_sweep_total:
+                    self._append_log(
+                        f"  … sweep {d}/{self._note_sweep_total}, "
+                        f"+{self._note_sweep_stats['stored']} new notes so far.")
+                try:
+                    self.root.after(self._NOTE_SWEEP_THROTTLE_MS,
+                                    self._sweep_next_student)
+                except Exception:
+                    pass
+            try:
+                self.root.after(0, after)
+            except Exception:
+                pass
+        self.worker.submit_fetch_notes(
+            s["student_id"], on_done, contact_id=s["contact_id"])
+
+    def _cancel_note_sweep(self) -> None:
+        if getattr(self, "_note_sweep_active", False):
+            self._note_sweep_cancel = True
+            self._append_log("Note sweep: cancelling after the current student…")
+        else:
+            self._append_log("No note sweep is running.")
 
     def _reapply_notes_font(self, size=None) -> None:
         p = getattr(self, "caseload_panel", None)
