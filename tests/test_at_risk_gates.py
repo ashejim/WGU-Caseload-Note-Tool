@@ -30,10 +30,12 @@ def _tmp_db():
 
 
 def _insert(conn, day, sid, course, rank, *, task="", start=PAST_START,
-            others="", name="Test Student", status="Registered"):
+            others="", name="Test Student", status="Registered", stall=None):
     ej = {"CourseStartDate": start, "OtherCourses": others,
           "DaysSinceLastCourseContact": "3", "TermDaysLeft": "20",
           "CourseStatus": status, "Icenddate": ""}
+    if stall is not None:
+        ej["NumberOfDaysSinceLastTaskDate"] = str(stall)
     conn.execute(
         "INSERT INTO collections (collected_at, collected_date, bucket, "
         "row_count) VALUES (?, ?, ?, 1)", (f"{day}T09:00:00", day, day))
@@ -94,13 +96,29 @@ def test_gate1_recovered_is_excluded():
         os.unlink(db)
 
 
-def test_gate2_task_passed_is_excluded():
+def test_gate2_task_passed_and_active_excluded():
+    # Passed a task and recently active (small stall) -> safe -> excluded.
     db = _build([
-        ("111", "C769", [("2026-07-01", 1, {"task": "Passed"}),
-                         ("2026-08-02", 1, {"task": "Passed"})]),
+        ("111", "C769", [("2026-07-01", 1, {"task": "Passed", "stall": 3}),
+                         ("2026-08-02", 1, {"task": "Passed", "stall": 5})]),
     ])
     try:
         assert _ids(history.at_risk_students(db_path=db, now=NOW)) == set()
+    finally:
+        os.unlink(db)
+
+
+def test_gate2_passed_then_stalled_included():
+    # Passed a task but then went quiet (>=21d stall) -> the FINDINGS §8 55%
+    # risk group -> must be INCLUDED (the old blunt gate dropped it).
+    db = _build([
+        ("111", "C769", [("2026-07-01", 1, {"task": "Passed", "stall": 4}),
+                         ("2026-08-02", 1, {"task": "Passed", "stall": 34})]),
+    ])
+    try:
+        rows = history.at_risk_students(db_path=db, now=NOW)
+        assert _ids(rows) == {"111"}, _ids(rows)
+        assert "stalled 34d" in rows[0]["risk_note"], rows[0]["risk_note"]
     finally:
         os.unlink(db)
 

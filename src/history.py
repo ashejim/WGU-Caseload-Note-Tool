@@ -1196,6 +1196,11 @@ def _to_int(x):
         return None
 
 
+# Days since last task activity at/above which a student counts as "stalled"
+# (FINDINGS §8: a task-passer who then goes quiet ≥21d drops to ~55% pass).
+STALL_RISK_DAYS = 21
+
+
 def at_risk_students(*, db_path=HISTORY_DB, ranks=(1, 2), strict=True,
                      now: Optional[datetime] = None) -> list[dict]:
     """Current-caseload students genuinely stuck at low Momentum.
@@ -1207,8 +1212,13 @@ def at_risk_students(*, db_path=HISTORY_DB, ranks=(1, 2), strict=True,
       1. **never recovered** — rank in ``ranks`` (Low/Med-Low) now AND the
          student's MAX rank across their whole snapshot history is still ≤ 2
          (recovery is the real split: recovered low → 86% pass vs stayed-low 69%);
-      2. **task not already 'Passed'** — Momentum lags task progress, so a Low
-         reading on a student who already cleared their task is stale, not risk;
+      2. **task activity** (FINDINGS §8 — task activity beats Momentum as a
+         predictor) — a student who has passed a task is only safe if STILL
+         ACTIVE: keep them out only when they passed a task AND their last task
+         activity was recent (< ``STALL_RISK_DAYS``). A student who *passed a task
+         then went quiet* (≥21d stall) is a real ~55%-risk group the old
+         "exclude anyone task-passed" gate silently dropped; and a student who
+         has passed NO task stays in regardless. ``risk_note`` says which;
       3. **course underway** — ``CourseStatus`` is not 'Planned' AND
          ``CourseStartDate`` is in the past. 'Planned' means enrolled-but-not-
          begun (every such row has weeksincourse 0), and a future/absent start
@@ -1262,6 +1272,9 @@ def at_risk_students(*, db_path=HISTORY_DB, ranks=(1, 2), strict=True,
         entry_rank = past[0] if past else r["momentum_rank"]
         max_rank = max(past) if past else r["momentum_rank"]
         task_status = r["latest_task_status"] or ""
+        task_passed = task_status.strip() == "Passed"
+        stall = _to_int(_ej_get(e, "NumberOfDaysSinceLastTaskDate"))
+        stalled = stall is not None and stall >= STALL_RISK_DAYS
         others = count_other_courses(_ej_get(e, "OtherCourses"), r["course_code"])
         start = _parse_date(_ej_get(e, "CourseStartDate"))
         days_into = (today - start).days if start else None
@@ -1270,7 +1283,9 @@ def at_risk_students(*, db_path=HISTORY_DB, ranks=(1, 2), strict=True,
         if strict:
             if max_rank > 2:                       # gate 1: recovered at some point
                 continue
-            if task_status.strip() == "Passed":    # gate 2: already passed a task
+            # gate 2 (task activity): a task-passed student is safe only while
+            # active — drop only when they passed a task AND aren't stalled.
+            if task_passed and not stalled:
                 continue
             # gate 3: course genuinely underway (not 'Planned', start in the past)
             if status == "Planned" or days_into is None or days_into <= 0:
@@ -1281,6 +1296,11 @@ def at_risk_students(*, db_path=HISTORY_DB, ranks=(1, 2), strict=True,
         cur = r["momentum_rank"]
         trend = "▬" if cur == entry_rank else (
             "▲" if cur > entry_rank else "▼")
+        if not task_passed:
+            risk_note = ("no task passed"
+                         + (f" · stalled {stall}d" if stalled else ""))
+        else:
+            risk_note = f"passed a task, then stalled {stall}d"
         out.append({
             "momentum_rank": cur,
             "momentum": r["momentum"] or "",
@@ -1288,19 +1308,23 @@ def at_risk_students(*, db_path=HISTORY_DB, ranks=(1, 2), strict=True,
             "student_id": r["student_id"],
             "course_code": r["course_code"],
             "task_status": task_status,
+            "task_passed": task_passed,
+            "risk_note": risk_note,
             "entry_rank": entry_rank,
             "max_rank": max_rank,
             "trend": trend,
             "days_into_course": days_into,
-            "days_since_task": _to_int(_ej_get(e, "NumberOfDaysSinceLastTaskDate")),
+            "days_since_task": stall,
             "days_since_contact": _to_int(_ej_get(e, "DaysSinceLastCourseContact")),
             "term_days_left": _to_int(_ej_get(e, "TermDaysLeft")),
             "other_courses": others,
             "ic_end": _ej_get(e, "Icenddate"),
         })
+    # Sort by urgency: soonest term deadline, then longest task stall (the §8
+    # risk), then deepest into the course.
     out.sort(key=lambda a: (
         a["term_days_left"] if a["term_days_left"] is not None else 1 << 30,
-        -(a["days_into_course"] or 0)))
+        -(a["days_since_task"] or 0), -(a["days_into_course"] or 0)))
     return out
 
 

@@ -818,16 +818,16 @@ class DataPanel:
     # Column key (matches history.at_risk_students() fields), heading, width,
     # anchor. 'momentum' sorts by rank, not the label text (see _ar_sort_by).
     _AR_COLS = [
-        ("momentum", "Momentum", 80, "center"),
-        ("trend", "Trend", 48, "center"),
-        ("name", "Student", 150, "w"),
-        ("student_id", "ID", 80, "center"),
-        ("course_code", "Course", 58, "center"),
-        ("task_status", "Last task", 112, "w"),
-        ("days_into_course", "Days in", 56, "center"),
-        ("days_since_contact", "dContact", 64, "center"),
-        ("term_days_left", "Term left", 66, "center"),
-        ("ic_end", "IC ext", 86, "center"),
+        ("momentum", "Momentum", 78, "center"),
+        ("trend", "Trend", 44, "center"),
+        ("name", "Student", 140, "w"),
+        ("student_id", "ID", 78, "center"),
+        ("course_code", "Course", 54, "center"),
+        ("task_status", "Last task", 90, "w"),
+        ("days_since_task", "Stall", 46, "center"),
+        ("days_into_course", "Days in", 52, "center"),
+        ("term_days_left", "Term left", 60, "center"),
+        ("risk_note", "Why flagged", 190, "w"),
     ]
 
     def _view_atrisk(self, parent) -> None:
@@ -858,13 +858,13 @@ class DataPanel:
         self._ar_fill(rows)
         low = sum(1 for r in rows if r["momentum_rank"] == 1)
         self.status.configure(text=(
-            f"{len(rows)} genuinely stuck-low students (Low {low}, Med-Low "
-            f"{len(rows) - low}). Filtered to the real risk: momentum never "
-            "recovered, last task not yet passed, course underway, and no other "
-            "course to finish first (jugglers pass ~81% and are excluded; "
-            "sole-focus low students pass only ~50%). Sorted by urgency (term "
-            "days left, then days into course). Click a header to re-sort; "
-            "double-click a row to copy the Student ID."))
+            f"{len(rows)} genuinely at-risk students (Low {low}, Med-Low "
+            f"{len(rows) - low}). Momentum never recovered, course underway, no "
+            "other course to finish first — AND a task-activity risk: either no "
+            "task passed yet, or passed a task then stalled ≥21 days (that group "
+            "drops to ~55% pass). 'Why flagged' + 'Stall' (days since last task) "
+            "show which. Sorted by term days left, then longest stall. Double-"
+            "click a row to copy the Student ID."))
 
     def _ar_fill(self, rows) -> None:
         t = self._ar_tree
@@ -877,9 +877,9 @@ class DataPanel:
                      iid=f"{r['student_id']}|{r['course_code']}",
                      values=(r["momentum"], r.get("trend", ""), r["name"],
                              r["student_id"], r["course_code"], r["task_status"],
+                             sv(r.get("days_since_task")),
                              sv(r.get("days_into_course")),
-                             sv(r["days_since_contact"]),
-                             sv(r["term_days_left"]), r["ic_end"] or "—"),
+                             sv(r["term_days_left"]), r.get("risk_note", "")),
                      tags=(tag,))
 
     def _ar_sort_by(self, key) -> None:
