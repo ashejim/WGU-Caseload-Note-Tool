@@ -21,13 +21,13 @@ class DataPanel:
 
     # Views (label -> key). Extensible: add a builder + an entry here.
     _VIEWS = {"Pass rate vs prediction": "calibration",
-              "At-risk students": "atrisk",
+              "Chase list": "atrisk",
               "Momentum trajectory": "trajectory",
               "Pass rate over time": "overtime",
               "Completion by month": "completion"}
     # Short labels for the on-screen view switcher (segmented button — must stay
     # compact so all fit the narrow docked pane).
-    _VIEW_LABELS = {"Calibration": "calibration", "At-risk": "atrisk",
+    _VIEW_LABELS = {"Calibration": "calibration", "Chase": "atrisk",
                     "Trajectory": "trajectory", "Over time": "overtime",
                     "Completion": "completion"}
     # Completion-view month axis (label -> history.completion_by_month `by`).
@@ -814,20 +814,21 @@ class DataPanel:
         c.create_text(L + 176, ly - 4, anchor="w", fill=fg, font=("", 8),
                       text="predicted band")
 
-    # ---- view: at-risk students (table) ---------------------------------
-    # Column key (matches history.at_risk_students() fields), heading, width,
-    # anchor. 'momentum' sorts by rank, not the label text (see _ar_sort_by).
+    # ---- view: chase list (table) ---------------------------------------
+    # The reachable never-attempted students who most need a nudge (FINDINGS
+    # §12/§15). Column key matches history.at_risk_students() fields; two display
+    # columns ('contact_pref', 'replied') are formatted in _ar_fill.
     _AR_COLS = [
-        ("momentum", "Momentum", 78, "center"),
-        ("trend", "Trend", 44, "center"),
         ("name", "Student", 140, "w"),
         ("student_id", "ID", 78, "center"),
         ("course_code", "Course", 54, "center"),
-        ("task_status", "Last task", 90, "w"),
-        ("days_since_task", "Stall", 46, "center"),
-        ("days_into_course", "Days in", 52, "center"),
-        ("term_days_left", "Term left", 60, "center"),
-        ("risk_note", "Why flagged", 190, "w"),
+        ("weeks_enrolled", "Wks in", 48, "center"),
+        ("days_since_contact", "No contact", 68, "center"),
+        ("term_days_left", "Term left", 58, "center"),
+        ("reachable", "Reach", 78, "center"),
+        ("suggested_channel", "Suggested", 74, "center"),
+        ("contact_pref", "Pref", 66, "center"),
+        ("ever_responded", "Replied?", 58, "center"),
     ]
 
     def _view_atrisk(self, parent) -> None:
@@ -848,23 +849,25 @@ class DataPanel:
             tree.heading(key, text=title,
                          command=lambda k=key: self._ar_sort_by(k))
             tree.column(key, width=w, anchor=anchor, stretch=(key == "name"))
-        tree.tag_configure("low", foreground="#e0524f")     # Low = red
-        tree.tag_configure("medlow", foreground="#d99a2b")  # Med-Low = amber
+        # Row colour flags outreach difficulty: red = never replied on any
+        # channel (a cold contact), amber = has engaged at least once.
+        tree.tag_configure("cold", foreground="#e0524f")
+        tree.tag_configure("warm", foreground="#d99a2b")
         tree.grid(row=0, column=0, sticky="nsew")
         sb = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
         sb.grid(row=0, column=1, sticky="ns")
         tree.configure(yscrollcommand=sb.set)
         tree.bind("<Double-1>", self._ar_open)
         self._ar_fill(rows)
-        low = sum(1 for r in rows if r["momentum_rank"] == 1)
+        cold = sum(1 for r in rows if not r.get("ever_responded"))
         self.status.configure(text=(
-            f"{len(rows)} genuinely at-risk students (Low {low}, Med-Low "
-            f"{len(rows) - low}). Momentum never recovered, course underway, no "
-            "other course to finish first — AND a task-activity risk: either no "
-            "task passed yet, or passed a task then stalled ≥21 days (that group "
-            "drops to ~55% pass). 'Why flagged' + 'Stall' (days since last task) "
-            "show which. Sorted by term days left, then longest stall. Double-"
-            "click a row to copy the Student ID."))
+            f"{len(rows)} students to chase ({cold} never replied). Reachable, "
+            "course underway, NEVER attempted a task (attempting ≈ passing), and "
+            "enrolled long enough to be a real stall — the group that most needs a "
+            "nudge. 'Suggested' is the channel to lead with (their preference, "
+            "else text if opted-in); 'Pref' shows it (* = manual override, else "
+            "auto-inferred from replies). Sorted by term days left, then longest "
+            "enrolled, then most neglected. Double-click a row to copy the ID."))
 
     def _ar_fill(self, rows) -> None:
         t = self._ar_tree
@@ -872,21 +875,25 @@ class DataPanel:
             t.delete(i)
         sv = lambda x: "" if x is None else str(x)
         for r in rows:
-            tag = "low" if r["momentum_rank"] == 1 else "medlow"
+            tag = "warm" if r.get("ever_responded") else "cold"
+            pref = r.get("contact_pref") or ""
+            if pref and r.get("contact_pref_source") == "manual":
+                pref += "*"
             t.insert("", "end",
                      iid=f"{r['student_id']}|{r['course_code']}",
-                     values=(r["momentum"], r.get("trend", ""), r["name"],
-                             r["student_id"], r["course_code"], r["task_status"],
-                             sv(r.get("days_since_task")),
-                             sv(r.get("days_into_course")),
-                             sv(r["term_days_left"]), r.get("risk_note", "")),
+                     values=(r["name"], r["student_id"], r["course_code"],
+                             sv(r.get("weeks_enrolled")),
+                             sv(r.get("days_since_contact")),
+                             sv(r["term_days_left"]), r.get("reachable", ""),
+                             r.get("suggested_channel", ""), pref,
+                             "yes" if r.get("ever_responded") else "never"),
                      tags=(tag,))
 
     def _ar_sort_by(self, key) -> None:
         st = self._ar_sort
         st["rev"] = (not st["rev"]) if st["col"] == key else False
         st["col"] = key
-        field = "momentum_rank" if key == "momentum" else key
+        field = key
 
         def sort_key(r):
             v = r.get(field)
