@@ -6056,6 +6056,13 @@ class CaseloadPanel:
                 self.app._sweep_note_history(
                     force=("force" in parts), scope=scope)
             return "break"
+        # DIAGNOSTIC: "coursescan:" reports what the caseload-grid feed has
+        # accumulated (by course + contact-id coverage). Run after switching the
+        # browser to 'any course' → a course code to see if that view exposes the
+        # whole-course roster via the same feed. Read-only.
+        if q.lower().startswith("coursescan"):
+            self.app._probe_grid_courses()
+            return "break"
         # DIAGNOSTIC: "griddiff:" compares the intercepted grid JSON against the
         # CSV column by column (writes griddiff_report.txt) — proves whether the
         # JSON can replace the CSV before switching the data path. Read-only.
@@ -22561,6 +22568,40 @@ class App:
             self._append_log("Note sweep: cancelling after the current student…")
         else:
             self._append_log("No note sweep is running.")
+
+    def _probe_grid_courses(self) -> None:
+        """Read-only: report what the live caseload-grid feed has accumulated,
+        broken down by course + contact-id coverage. Run AFTER switching the
+        caseload browser to 'any course' → a course code, to check whether that
+        view fires the same getCaseLoadMainGridData feed (so we can capture the
+        whole-course roster — all faculty — for free)."""
+        from collections import Counter
+        grid = self.worker.grid_rows_by_key()
+        if not grid:
+            self._append_log("Grid capture is empty — load the caseload first.",
+                             error=True)
+            return
+        by_course, cid_by = Counter(), Counter()
+        for (sid, course), row in grid.items():
+            by_course[course] += 1
+            if str(row.get("contactID") or "").startswith("003"):
+                cid_by[course] += 1
+        self._append_log(
+            f"Grid capture: {len(grid)} rows across {len(by_course)} course(s).")
+        for course, n in by_course.most_common(15):
+            self._append_log(f"  {course}: {n} students, {cid_by[course]} with a "
+                             "003 contact id")
+        # Dump a sample row's assignment/pass-status-ish fields so we can see
+        # whether cross-faculty + pass-color info rides along.
+        for (sid, course), row in grid.items():
+            keys = [k for k in row if any(t in k.lower() for t in (
+                "color", "css", "status", "mentor", "instructor", "ci",
+                "assign", "faculty"))]
+            if keys:
+                self._append_log(
+                    f"  sample {course} {sid} fields: "
+                    + ", ".join(f"{k}={str(row.get(k))[:20]!r}" for k in keys[:7]))
+                break
 
     def _reapply_notes_font(self, size=None) -> None:
         p = getattr(self, "caseload_panel", None)
