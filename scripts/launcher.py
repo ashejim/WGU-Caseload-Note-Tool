@@ -6062,10 +6062,12 @@ class CaseloadPanel:
         # whole-course roster via the same feed. Read-only.
         if q.lower().startswith("coursescan"):
             rest = q.split(":", 1)[1].strip().lower() if ":" in q else ""
-            if rest == "capture":
-                self.app._course_scan_capture()
-            elif rest == "dump":
-                self.app._course_scan_dump()
+            parts = rest.split()
+            if parts and parts[0] == "capture":
+                secs = 60
+                if len(parts) > 1 and parts[1].isdigit():
+                    secs = max(15, min(180, int(parts[1])))
+                self.app._course_scan_capture(secs)
             else:
                 self.app._probe_grid_courses()
             return "break"
@@ -22609,19 +22611,15 @@ class App:
                     + ", ".join(f"{k}={str(row.get(k))[:20]!r}" for k in keys[:7]))
                 break
 
-    def _course_scan_capture(self) -> None:
-        """Arm generic SF-response capture to discover which endpoint the caseload
-        browser's 'any course' view uses (it isn't getCaseLoadMainGridData)."""
-        def on_done(_r):
-            self.root.after(0, lambda: self._append_log(
-                "Course-scan capture ARMED. Now: in the browser switch to 'any "
-                "course' → C769, SCROLL the list to load rows, then type "
-                "'coursescan: dump'."))
-        self.worker.submit_start_capture(on_done)
+    def _course_scan_capture(self, seconds: int = 60) -> None:
+        """Record SF data responses for `seconds` while you manually switch the
+        browser to the 'any course' → C769 view + scroll, to discover the endpoint
+        that feeds it. Reports which responses carry StudentID and writes the full
+        bodies to coursescan_report.txt."""
+        self._append_log(
+            f"Course-scan: recording for {seconds}s. In the browser, switch to "
+            "'any course' → C769 and SCROLL the list to load rows NOW…")
 
-    def _course_scan_dump(self) -> None:
-        """Stop capture; report which responses carry a student roster and write
-        the full bodies to coursescan_report.txt for inspection."""
         def on_done(res):
             def render():
                 log = (res or {}).get("log") or []
@@ -22633,7 +22631,7 @@ class App:
                         cands.append((n, e.get("url", ""), e.get("body_len", 0)))
                 cands.sort(reverse=True)
                 self._append_log(
-                    f"Course-scan dump: {len(log)} data responses; "
+                    f"Course-scan: {len(log)} data responses captured; "
                     f"{len(cands)} carry StudentID.")
                 for n, url, blen in cands[:8]:
                     self._append_log(f"  {n}× StudentID · {blen}b · {url[:80]}")
@@ -22649,7 +22647,7 @@ class App:
                 except Exception as ex:
                     self._append_log(f"  (write failed: {ex})", error=True)
             self.root.after(0, render)
-        self.worker.submit_dump_capture(on_done)
+        self.worker.submit_probe_course_capture(seconds, on_done)
 
     def _reapply_notes_font(self, size=None) -> None:
         p = getattr(self, "caseload_panel", None)

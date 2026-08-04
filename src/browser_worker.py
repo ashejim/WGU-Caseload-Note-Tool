@@ -356,15 +356,15 @@ class BrowserWorker:
         None), schedule_name, commit."""
         self.q.put(("SEND_TEXT", payload, on_done))
 
-    def submit_start_capture(self, on_done: Callable[[dict], None]) -> None:
-        """Begin recording Salesforce DATA responses into _capture_log (generic
-        endpoint discovery — e.g. finding which Aura action the 'any course' view
-        uses). Stop + read with submit_dump_capture."""
-        self.q.put(("START_CAPTURE", on_done))
-
-    def submit_dump_capture(self, on_done: Callable[[dict], None]) -> None:
-        """Stop the generic capture and return the accumulated response log."""
-        self.q.put(("DUMP_CAPTURE", on_done))
+    def submit_probe_course_capture(
+        self, seconds: float, on_done: Callable[[dict], None],
+    ) -> None:
+        """Record Salesforce DATA responses for `seconds` while the user manually
+        drives the browser (e.g. switches to the 'any course' view + scrolls), so
+        we discover which endpoint feeds it. Must actively pump Playwright the
+        whole window — a context response listener never fires while the worker
+        sits idle on the queue. Returns {log:[…]}."""
+        self.q.put(("PROBE_COURSE_CAPTURE", seconds, on_done))
 
     def submit_arm_text_capture(self, on_done: Callable[[dict], None]) -> None:
         """Attach a persistent network recorder to the open Mongoose tab (tool
@@ -853,17 +853,11 @@ class BrowserWorker:
                 res = self._send_text(ctx, payload)
             finally:
                 on_done(res)
-        elif cmd[0] == "START_CAPTURE":
-            _, on_done = cmd
-            try:
-                self.start_request_capture()
-            finally:
-                on_done({"ok": True})
-        elif cmd[0] == "DUMP_CAPTURE":
-            _, on_done = cmd
+        elif cmd[0] == "PROBE_COURSE_CAPTURE":
+            _, seconds, on_done = cmd
             res = {}
             try:
-                res = {"log": self.stop_request_capture()}
+                res = self._probe_course_capture(ctx, seconds)
             finally:
                 on_done(res)
         elif cmd[0] == "ARM_TEXT_CAPTURE":
@@ -2335,6 +2329,29 @@ class BrowserWorker:
         even if capture wasn't running."""
         self._capture_active = False
         return list(self._capture_log)
+
+    def _probe_course_capture(self, ctx, seconds: float) -> dict:
+        """Record SF data responses for `seconds` while the user manually drives
+        the browser. Crucial: we hold Playwright in a wait loop the whole time so
+        the context 'response' listener actually fires for the user's clicks —
+        otherwise (worker idle on the queue) those responses are never processed
+        and the log comes back empty."""
+        import time as _t
+        target = self._active_page(ctx)
+        self.start_request_capture()
+        self.on_status(
+            f"Course capture: recording for {int(seconds)}s — switch the browser "
+            "to 'any course' → C769 and SCROLL the list NOW…")
+        t0 = _t.time()
+        while _t.time() - t0 < float(seconds):
+            try:
+                if target is not None:
+                    target.wait_for_timeout(500)   # pumps pending response events
+                else:
+                    _t.sleep(0.5)
+            except Exception:
+                break
+        return {"log": self.stop_request_capture()}
 
     def _on_request(self, request) -> None:
         """Context-level request listener. ALWAYS harvests the live aura.token +
