@@ -307,12 +307,15 @@ class BrowserWorker:
 
     def submit_fetch_notes(
         self, query: str, on_done: Callable[[dict], None],
-        contact_id: str = "",
+        contact_id: str = "", off_caseload: bool = False,
     ) -> None:
         """Open the student's record, wait for their notes to load, and
         scrape them (ALL authors). Deep-links via `contact_id` when given
-        (independent of the caseload view's columns). on_done({notes, …})."""
-        self.q.put(("FETCH_NOTES", query, contact_id, on_done))
+        (independent of the caseload view's columns). ``off_caseload`` routes a
+        student without a deep-link id through SF GLOBAL search (the caseload
+        row-filter can't reach departed/other-instructor students).
+        on_done({notes, …})."""
+        self.q.put(("FETCH_NOTES", query, contact_id, on_done, off_caseload))
 
     def submit_fetch_my_notes(
         self, query: str, on_done: Callable[[dict], None],
@@ -804,11 +807,12 @@ class BrowserWorker:
             finally:
                 on_done(info)
         elif cmd[0] == "FETCH_NOTES":
-            _, query, contact_id, on_done = cmd
+            _, query, contact_id, on_done, off_caseload = cmd
             res = {}
             try:
-                res = self._fetch_student_notes(ctx, query,
-                                                contact_id=contact_id)
+                res = self._fetch_student_notes(
+                    ctx, query, contact_id=contact_id,
+                    off_caseload=off_caseload)
             finally:
                 on_done(res)
         elif cmd[0] == "FETCH_MY_NOTES":
@@ -3914,6 +3918,7 @@ class BrowserWorker:
 
     def _fetch_student_notes(
         self, ctx, query: str, max_notes: int = 60, contact_id: str = "",
+        off_caseload: bool = False,
     ) -> dict:
         """Open the student's record and scrape their note history.
 
@@ -3936,6 +3941,15 @@ class BrowserWorker:
             navigated = False
             if (contact_id or "").startswith("003"):
                 navigated = self._navigate_to_contact(ctx, contact_id)
+            if not navigated and off_caseload:
+                # Off-caseload (departed / other-instructor) student with no
+                # deep-link id: the caseload row-filter search can't reach them,
+                # so drive Salesforce's GLOBAL search instead.
+                try:
+                    r = self._open_contact_by_global_search(ctx, query)
+                    navigated = bool(r.get("ok") or r.get("contact_id"))
+                except Exception:
+                    navigated = False
             if not navigated:
                 self._handle_find(ctx, query, new_tab=False, raise_after=False)
         except Exception as e:

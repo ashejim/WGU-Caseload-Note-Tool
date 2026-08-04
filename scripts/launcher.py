@@ -22496,6 +22496,7 @@ class App:
             return
         self._note_sweep_active = True
         self._note_sweep_cancel = False
+        self._note_sweep_scope = scope
         self._note_sweep_queue = worklist
         self._note_sweep_total = len(worklist)
         self._note_sweep_stats = {"done": 0, "stored": 0, "errors": 0}
@@ -22551,7 +22552,8 @@ class App:
             except Exception:
                 pass
         self.worker.submit_fetch_notes(
-            s["student_id"], on_done, contact_id=s["contact_id"])
+            s["student_id"], on_done, contact_id=s["contact_id"],
+            off_caseload=(getattr(self, "_note_sweep_scope", "") == "departed"))
 
     def _cancel_note_sweep(self) -> None:
         if getattr(self, "_note_sweep_active", False):
