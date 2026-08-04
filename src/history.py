@@ -208,6 +208,17 @@ CREATE TABLE IF NOT EXISTS notes (
 CREATE INDEX IF NOT EXISTS ix_notes_student ON notes(student_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_notes_contact ON notes(contact_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_notes_channel ON notes(channel, direction);
+
+-- Per-student user-managed flags. Only MANUAL overrides live here; auto-derived
+-- values (contact preference from note history, chase-list membership from the
+-- live criteria) are computed on the fly. contact_pref: 'text'/'email'/'call'
+-- set by the instructor (e.g. "student wants texts only") — takes precedence
+-- over the auto-inferred preference.
+CREATE TABLE IF NOT EXISTS student_flags (
+    student_id   TEXT PRIMARY KEY,
+    contact_pref TEXT,
+    updated_at   TEXT
+);
 """
 
 
@@ -681,6 +692,69 @@ def persist_notes(notes, *, student_id: str = "", contact_id: str = "",
         return {"inserted": ins, "updated": upd, "skipped": skip}
     except Exception as e:  # never break the notes-view render
         return {"status": "error", "error": str(e)}
+
+
+_CONTACT_PREFS = ("text", "email", "call")
+
+
+def set_contact_preference(student_id: str, pref: str, *,
+                           db_path=HISTORY_DB, now: Optional[datetime] = None):
+    """Manually set a student's contact preference (instructor override, e.g.
+    "wants texts only"). ``pref`` in {'text','email','call'}; '' clears the
+    override (revert to auto-inferred). Takes precedence over the auto value."""
+    pref = (pref or "").strip().lower()
+    if pref and pref not in _CONTACT_PREFS:
+        raise ValueError(f"pref must be one of {_CONTACT_PREFS} or ''")
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
+    conn = _connect(db_path)
+    try:
+        with conn:
+            if pref:
+                conn.execute(
+                    "INSERT INTO student_flags (student_id, contact_pref, "
+                    "updated_at) VALUES (?, ?, ?) ON CONFLICT(student_id) DO "
+                    "UPDATE SET contact_pref = excluded.contact_pref, "
+                    "updated_at = excluded.updated_at", (student_id, pref, ts))
+            else:
+                conn.execute("UPDATE student_flags SET contact_pref = '', "
+                             "updated_at = ? WHERE student_id = ?", (ts, student_id))
+    finally:
+        conn.close()
+
+
+def _manual_contact_pref(student_id: str, *, db_path=HISTORY_DB) -> str:
+    conn = _connect(db_path)
+    try:
+        r = conn.execute("SELECT contact_pref FROM student_flags WHERE "
+                         "student_id = ?", (student_id,)).fetchone()
+        return (r["contact_pref"] or "") if r else ""
+    finally:
+        conn.close()
+
+
+def contact_preference(student_id: str, *, db_path=HISTORY_DB,
+                       _ledger=None) -> dict:
+    """A student's contact preference: the channel they actually engage on.
+    Manual instructor override wins; otherwise auto-inferred from the note
+    history (the channel with the most INBOUND events — text/email/call — since
+    an inbound is the student choosing that channel). Returns
+    {pref: 'text'|'email'|'call'|'', source: 'manual'|'auto'|'none'}."""
+    manual = _manual_contact_pref(student_id, db_path=db_path)
+    if manual:
+        return {"pref": manual, "source": "manual"}
+    led = _ledger if _ledger is not None else engagement_ledger(
+        student_id, db_path=db_path)
+    # inbound counts per channel; calls count as engagement on the call channel.
+    scores = {}
+    for c, info in led.get("channels", {}).items():
+        inbound = info.get("in", 0) + (info.get("out", 0) if c == "call" else 0)
+        if inbound:
+            scores[c] = inbound
+    if not scores:
+        return {"pref": "", "source": "none"}
+    # most-engaged channel; tie-break by lower cost (text < email < call).
+    best = max(scores, key=lambda c: (scores[c], -_CHANNEL_COST.get(c, 9)))
+    return {"pref": best, "source": "auto"}
 
 
 def notes_count(*, db_path=HISTORY_DB) -> int:
@@ -1310,45 +1384,45 @@ def _to_int(x):
         return None
 
 
-# Days since last task activity at/above which a student counts as "stalled"
-# (FINDINGS §8: a task-passer who then goes quiet ≥21d drops to ~55% pass).
-STALL_RISK_DAYS = 21
+# Enrolled at least this long WITHOUT attempting a task = a real stall worth
+# chasing (FINDINGS §8/§15: fresh non-attempters self-start; the aged ones are
+# the risk). Weeks, from `weeksincourse` (or course-start age).
+CHASE_MIN_WEEKS = 6
 
 
-def at_risk_students(*, db_path=HISTORY_DB, ranks=(1, 2), strict=True,
-                     now: Optional[datetime] = None) -> list[dict]:
-    """Current-caseload students genuinely stuck at low Momentum.
+def _has_attempted(latest_task_status: str, e: dict) -> bool:
+    """Has the student engaged ANY task (submitted/passed/returned)? For C769 the
+    causal risk is never-attempting (attempting ≈ passing, FINDINGS §12)."""
+    if (latest_task_status or "").strip():
+        return True
+    if _ej_get(e, "LatestTaskStatus") or _ej_get(e, "LatestTaskDate"):
+        return True
+    if (_to_int(_ej_get(e, "LatestTaskAttempts")) or 0) > 0:
+        return True
+    for n in (1, 2, 3):
+        if (e.get(f"Task{n}Status") or "").strip():
+            return True
+    return False
 
-    In ``strict`` mode (default) applies the four empirically-validated gates
-    from data_analysis/FINDINGS.md §5, each of which removed a distinct block of
-    false positives from the naive "everyone currently Low/Med-Low" list:
 
-      1. **never recovered** — rank in ``ranks`` (Low/Med-Low) now AND the
-         student's MAX rank across their whole snapshot history is still ≤ 2
-         (recovery is the real split: recovered low → 86% pass vs stayed-low 69%);
-      2. **task activity** (FINDINGS §8 — task activity beats Momentum as a
-         predictor) — a student who has passed a task is only safe if STILL
-         ACTIVE: keep them out only when they passed a task AND their last task
-         activity was recent (< ``STALL_RISK_DAYS``). A student who *passed a task
-         then went quiet* (≥21d stall) is a real ~55%-risk group the old
-         "exclude anyone task-passed" gate silently dropped; and a student who
-         has passed NO task stays in regardless. ``risk_note`` says which;
-      3. **course underway** — ``CourseStatus`` is not 'Planned' AND
-         ``CourseStartDate`` is in the past. 'Planned' means enrolled-but-not-
-         begun (every such row has weeksincourse 0), and a future/absent start
-         date likewise means not begun — a low reading before the student has
-         started is meaningless (and future starts are a known dirty field);
-      4. **no other active course** — ``count_other_courses(OtherCourses) == 0``;
-         a juggler is low only because they're finishing earlier courses first
-         (they still pass ~81%). Only sole-focus low students are a real ~50% risk.
+def at_risk_students(*, db_path=HISTORY_DB, now: Optional[datetime] = None,
+                     min_weeks: int = CHASE_MIN_WEEKS) -> list[dict]:
+    """The CHASE LIST — the reachable students who most need a nudge to attempt
+    and aren't getting one (FINDINGS §12/§15). Gates on the current caseload:
 
-    ``strict=False`` reverts to the legacy behaviour (rank + not-resolved only).
+      1. **course underway** — CourseStatus not 'Planned', start in the past;
+      2. **never attempted a task** — the causal risk (attempt ≈ pass, §12);
+      3. **enrolled ≥ ``min_weeks``** — a real stall, not a fresh student who'll
+         self-start (§8/§15 time-weighting);
+      4. **not already resolved** (passed / not-passed in outcomes).
 
-    Reads the live caseload (latest snapshot) plus each student's momentum history
-    (for the recovery gate + trend). Excludes anyone already resolved in outcomes.
-    Sorted by urgency: fewest term-days-left first, then most days into the course.
-    Rows carry the instructor's triage fields plus ``entry_rank``, ``max_rank``,
-    ``trend`` (▲/▬/▼), and ``days_into_course`` (days since the course started)."""
+    Each row is an actionable worklist entry: urgency (term days left), how long
+    they've stalled (weeks enrolled), whether they're being missed (days since
+    contact), how to reach them (reachable channels + opt-in), the ledger-backed
+    ``suggested_channel`` and their ``contact_pref`` (manual override else the
+    channel they engage on), plus ``ever_responded`` and ``other_courses``.
+    Sorted by urgency: soonest deadline, then longest-enrolled, then longest since
+    contact (the most-neglected first)."""
     today = (now or datetime.now()).date()
     conn = _connect(db_path)
     try:
@@ -1360,21 +1434,11 @@ def at_risk_students(*, db_path=HISTORY_DB, ranks=(1, 2), strict=True,
                             (latest["collected_at"],)).fetchall()
         resolved = {(r["student_id"], r["course_code"]) for r in
                     conn.execute("SELECT student_id, course_code FROM outcomes")}
-        # Per-student momentum history (chronological) for the recovery gate +
-        # entry reading + trend — one pass over the whole snapshots table.
-        hist: dict = {}
-        for h in conn.execute("SELECT student_id, course_code, momentum_rank "
-                              "FROM snapshots ORDER BY collected_at ASC"):
-            if h["momentum_rank"] is not None:
-                hist.setdefault((h["student_id"], h["course_code"]), []).append(
-                    h["momentum_rank"])
     finally:
         conn.close()
 
     out = []
     for r in rows:
-        if r["momentum_rank"] not in ranks:
-            continue
         key = (r["student_id"], r["course_code"])
         if key in resolved:
             continue
@@ -1382,63 +1446,58 @@ def at_risk_students(*, db_path=HISTORY_DB, ranks=(1, 2), strict=True,
             e = json.loads(r["extra_json"] or "{}")
         except Exception:
             e = {}
-        past = hist.get(key, [])
-        entry_rank = past[0] if past else r["momentum_rank"]
-        max_rank = max(past) if past else r["momentum_rank"]
-        task_status = r["latest_task_status"] or ""
-        task_passed = task_status.strip() == "Passed"
-        stall = _to_int(_ej_get(e, "NumberOfDaysSinceLastTaskDate"))
-        stalled = stall is not None and stall >= STALL_RISK_DAYS
-        others = count_other_courses(_ej_get(e, "OtherCourses"), r["course_code"])
+        status = _ej_get(e, "CourseStatus")
         start = _parse_date(_ej_get(e, "CourseStartDate"))
         days_into = (today - start).days if start else None
-        status = _ej_get(e, "CourseStatus")
+        # gate 1: underway
+        if status == "Planned" or days_into is None or days_into <= 0:
+            continue
+        # gate 2: never attempted a task
+        if _has_attempted(r["latest_task_status"], e):
+            continue
+        # gate 3: enrolled long enough to be a real stall
+        weeks = _to_int(_ej_get(e, "weeksincourse"))
+        if weeks is None:
+            weeks = days_into // 7
+        if weeks < min_weeks:
+            continue
 
-        if strict:
-            if max_rank > 2:                       # gate 1: recovered at some point
-                continue
-            # gate 2 (task activity): a task-passed student is safe only while
-            # active — drop only when they passed a task AND aren't stalled.
-            if task_passed and not stalled:
-                continue
-            # gate 3: course genuinely underway (not 'Planned', start in the past)
-            if status == "Planned" or days_into is None or days_into <= 0:
-                continue
-            if others != 0:                        # gate 4: juggling other courses
-                continue
+        sid = r["student_id"]
+        led = engagement_ledger(sid, db_path=db_path)
+        pref = contact_preference(sid, db_path=db_path, _ledger=led)
+        opted_in = _ej_get(e, "TextingPreference") == "Opted In"
+        has_email = bool(_ej_get(e, "StudentEmail"))
+        reachable = [c for c, ok in (("text", opted_in), ("email", has_email)) if ok]
+        ever_responded = any(
+            (info.get("in", 0) or (info.get("out", 0) if c == "call" else 0))
+            for c, info in led.get("channels", {}).items())
+        # what to lead with: their preference; else text if reachable (§15 —
+        # disengaged respond 68–80% to text); else email.
+        suggested = pref["pref"] or ("text" if opted_in else "email")
 
-        cur = r["momentum_rank"]
-        trend = "▬" if cur == entry_rank else (
-            "▲" if cur > entry_rank else "▼")
-        if not task_passed:
-            risk_note = ("no task passed"
-                         + (f" · stalled {stall}d" if stalled else ""))
-        else:
-            risk_note = f"passed a task, then stalled {stall}d"
         out.append({
-            "momentum_rank": cur,
-            "momentum": r["momentum"] or "",
             "name": r["name"] or "",
-            "student_id": r["student_id"],
+            "student_id": sid,
             "course_code": r["course_code"],
-            "task_status": task_status,
-            "task_passed": task_passed,
-            "risk_note": risk_note,
-            "entry_rank": entry_rank,
-            "max_rank": max_rank,
-            "trend": trend,
+            "momentum": r["momentum"] or "",
+            "weeks_enrolled": weeks,
             "days_into_course": days_into,
-            "days_since_task": stall,
-            "days_since_contact": _to_int(_ej_get(e, "DaysSinceLastCourseContact")),
             "term_days_left": _to_int(_ej_get(e, "TermDaysLeft")),
-            "other_courses": others,
+            "days_since_contact": _to_int(
+                _ej_get(e, "DaysSinceLastCourseContact")),
+            "other_courses": count_other_courses(
+                _ej_get(e, "OtherCourses"), r["course_code"]),
+            "reachable": "+".join(reachable) if reachable else "—",
+            "opted_in_text": opted_in,
+            "contact_pref": pref["pref"],
+            "contact_pref_source": pref["source"],
+            "suggested_channel": suggested,
+            "ever_responded": ever_responded,
             "ic_end": _ej_get(e, "Icenddate"),
         })
-    # Sort by urgency: soonest term deadline, then longest task stall (the §8
-    # risk), then deepest into the course.
     out.sort(key=lambda a: (
         a["term_days_left"] if a["term_days_left"] is not None else 1 << 30,
-        -(a["days_since_task"] or 0), -(a["days_into_course"] or 0)))
+        -(a["weeks_enrolled"] or 0), -(a["days_since_contact"] or 0)))
     return out
 
 

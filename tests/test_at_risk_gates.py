@@ -1,8 +1,8 @@
-"""Tests for history.at_risk_students() — the 4-gate stuck-low filter.
+"""Tests for history.at_risk_students() — the CHASE LIST (FINDINGS §12/§15).
 
-Each gate (never-recovered / task-not-passed / course-underway / no-other-course)
-must exclude the false positives it was designed to remove (data_analysis/
-FINDINGS.md §5). A single genuinely-stuck student must survive all four.
+The list surfaces reachable students who most need a nudge to attempt and aren't
+getting one: course underway, NEVER attempted a task, enrolled >= min_weeks, not
+resolved. Each row carries reachability + suggested channel + contact preference.
 
 Run: python tests/test_at_risk_gates.py
 """
@@ -18,48 +18,40 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src import history  # noqa: E402
 
 NOW = datetime(2026, 8, 2, 12, 0, 0)
-PAST_START = "2026-05-01"     # underway
-FUTURE_START = "2026-10-01"   # not started yet
+PAST = "2026-05-01"      # ~13 weeks before NOW → underway
+FUTURE = "2026-10-01"
 
 
 def _tmp_db():
-    fd, path = tempfile.mkstemp(suffix=".db")
+    fd, p = tempfile.mkstemp(suffix=".db")
     os.close(fd)
-    os.unlink(path)
-    return path
+    os.unlink(p)
+    return p
 
 
-def _insert(conn, day, sid, course, rank, *, task="", start=PAST_START,
-            others="", name="Test Student", status="Registered", stall=None):
-    ej = {"CourseStartDate": start, "OtherCourses": others,
-          "DaysSinceLastCourseContact": "3", "TermDaysLeft": "20",
-          "CourseStatus": status, "Icenddate": ""}
-    if stall is not None:
-        ej["NumberOfDaysSinceLastTaskDate"] = str(stall)
-    conn.execute(
-        "INSERT INTO collections (collected_at, collected_date, bucket, "
-        "row_count) VALUES (?, ?, ?, 1)", (f"{day}T09:00:00", day, day))
+def _snap(conn, sid, course="C769", *, attempted="", start=PAST, weeks=10,
+          status="Registered", opted_in=True, email="s@wgu.edu",
+          name="Test Student", day="2026-08-02"):
+    ej = {"CourseStartDate": start, "CourseStatus": status,
+          "weeksincourse": str(weeks), "TermDaysLeft": "20",
+          "DaysSinceLastCourseContact": "12", "StudentEmail": email,
+          "TextingPreference": "Opted In" if opted_in else "Not Opted In"}
+    conn.execute("INSERT OR IGNORE INTO collections (collected_at, "
+                 "collected_date, bucket, row_count) VALUES (?, ?, ?, 1)",
+                 (f"{day}T09:00:00", day, day))
     conn.execute(
         "INSERT INTO snapshots (collected_at, collected_date, student_id, "
         "course_code, name, momentum, momentum_rank, latest_task_status, "
-        "extra_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (f"{day}T09:00:00", day, sid, course, name, "Low", rank, task,
-         json.dumps(ej)))
+        "extra_json) VALUES (?, ?, ?, ?, ?, 'Low', 1, ?, ?)",
+        (f"{day}T09:00:00", day, sid, course, name, attempted, json.dumps(ej)))
 
 
-def _build(specs):
-    """specs: list of (sid, [(day, rank, kwargs), ...]). Returns db path."""
+def _build(seed):
     db = _tmp_db()
-    conn = sqlite3.connect(db)
-    history._init_schema(conn) if hasattr(history, "_init_schema") else None
-    conn.close()
-    # _connect runs schema init; use it.
     conn = history._connect(db)
     try:
         with conn:
-            for sid, course, hist in specs:
-                for day, rank, kw in hist:
-                    _insert(conn, day, sid, course, rank, **kw)
+            seed(conn)
     finally:
         conn.close()
     return db
@@ -69,105 +61,79 @@ def _ids(rows):
     return {r["student_id"] for r in rows}
 
 
-def test_genuinely_stuck_student_survives_all_gates():
-    db = _build([
-        ("111", "C769", [("2026-07-01", 1, {}), ("2026-08-02", 1, {})]),
-    ])
+def test_includes_stalled_nonattempter():
+    db = _build(lambda c: _snap(c, "111"))
     try:
         rows = history.at_risk_students(db_path=db, now=NOW)
         assert _ids(rows) == {"111"}, _ids(rows)
         r = rows[0]
-        assert r["trend"] == "▬" and r["entry_rank"] == 1 and r["max_rank"] == 1
-        assert r["days_into_course"] > 0
+        assert r["reachable"] == "text+email"
+        assert r["suggested_channel"] == "text"   # opted-in, no known pref → text
+        assert r["weeks_enrolled"] == 10 and r["ever_responded"] is False
     finally:
         os.unlink(db)
 
 
-def test_gate1_recovered_is_excluded():
-    # Was Med (rank 3) at some point -> recovered -> not the risk, even if Low now.
-    db = _build([
-        ("111", "C769", [("2026-07-01", 3, {}), ("2026-08-02", 1, {})]),
-    ])
-    try:
-        assert _ids(history.at_risk_students(db_path=db, now=NOW)) == set()
-        # strict=False keeps it (legacy behaviour)
-        assert _ids(history.at_risk_students(db_path=db, now=NOW, strict=False)) == {"111"}
-    finally:
-        os.unlink(db)
-
-
-def test_gate2_task_passed_and_active_excluded():
-    # Passed a task and recently active (small stall) -> safe -> excluded.
-    db = _build([
-        ("111", "C769", [("2026-07-01", 1, {"task": "Passed", "stall": 3}),
-                         ("2026-08-02", 1, {"task": "Passed", "stall": 5})]),
-    ])
+def test_excludes_attempter():
+    db = _build(lambda c: _snap(c, "111", attempted="Task Submitted"))
     try:
         assert _ids(history.at_risk_students(db_path=db, now=NOW)) == set()
     finally:
         os.unlink(db)
 
 
-def test_gate2_passed_then_stalled_included():
-    # Passed a task but then went quiet (>=21d stall) -> the FINDINGS §8 55%
-    # risk group -> must be INCLUDED (the old blunt gate dropped it).
-    db = _build([
-        ("111", "C769", [("2026-07-01", 1, {"task": "Passed", "stall": 4}),
-                         ("2026-08-02", 1, {"task": "Passed", "stall": 34})]),
-    ])
-    try:
-        rows = history.at_risk_students(db_path=db, now=NOW)
-        assert _ids(rows) == {"111"}, _ids(rows)
-        assert "stalled 34d" in rows[0]["risk_note"], rows[0]["risk_note"]
-    finally:
-        os.unlink(db)
-
-
-def test_gate3_not_started_is_excluded():
-    db = _build([
-        ("111", "C769", [("2026-08-02", 1, {"start": FUTURE_START})]),
-    ])
+def test_excludes_fresh_enrollee():
+    db = _build(lambda c: _snap(c, "111", weeks=3))   # < min_weeks
     try:
         assert _ids(history.at_risk_students(db_path=db, now=NOW)) == set()
     finally:
         os.unlink(db)
 
 
-def test_gate3_planned_status_is_excluded():
-    # Start date is in the PAST but the course is still 'Planned' (not begun) —
-    # a low reading is meaningless, so it must be excluded.
-    db = _build([
-        ("111", "C769", [("2026-07-01", 1, {"status": "Planned"}),
-                         ("2026-08-02", 1, {"status": "Planned"})]),
-    ])
+def test_excludes_planned_and_future_start():
+    db = _build(lambda c: (_snap(c, "111", status="Planned"),
+                           _snap(c, "222", start=FUTURE, weeks=0)))
     try:
         assert _ids(history.at_risk_students(db_path=db, now=NOW)) == set()
     finally:
         os.unlink(db)
 
 
-def test_gate4_juggling_other_courses_is_excluded():
-    db = _build([
-        ("111", "C769", [("2026-07-01", 1, {"others": "D329, C769"}),
-                         ("2026-08-02", 1, {"others": "D329, C769"})]),
-    ])
+def test_excludes_resolved():
+    def seed(c):
+        _snap(c, "111")
+        c.execute("INSERT INTO outcomes (student_id, course_code, outcome) "
+                  "VALUES ('111','C769','passed')")
+    db = _build(seed)
     try:
         assert _ids(history.at_risk_students(db_path=db, now=NOW)) == set()
     finally:
         os.unlink(db)
 
 
-def test_resolved_student_excluded():
-    db = _build([
-        ("111", "C769", [("2026-07-01", 1, {}), ("2026-08-02", 1, {})]),
-    ])
+def test_not_opted_in_suggests_email():
+    db = _build(lambda c: _snap(c, "111", opted_in=False))
     try:
-        conn = history._connect(db)
-        with conn:
-            conn.execute("INSERT INTO outcomes (student_id, course_code, "
-                         "outcome) VALUES ('111', 'C769', 'passed')")
-        conn.close()
-        assert _ids(history.at_risk_students(db_path=db, now=NOW)) == set()
+        r = history.at_risk_students(db_path=db, now=NOW)[0]
+        assert r["reachable"] == "email"
+        assert r["suggested_channel"] == "email"
+    finally:
+        os.unlink(db)
+
+
+def test_contact_pref_drives_suggestion():
+    # student replies by text -> auto contact pref = text -> suggested = text
+    db = _build(lambda c: _snap(c, "111", opted_in=False))  # not opted-in now
+    try:
+        history.persist_notes(
+            [{"url": "", "type": "Instant Message (IM) / Text",
+              "text": "Incoming: hi", "course": "C769",
+              "date": "2026-07-01T09:00:00Z", "author": "x", "subject": "s"}],
+            student_id="111", db_path=db)
+        r = history.at_risk_students(db_path=db, now=NOW)[0]
+        assert r["contact_pref"] == "text" and r["contact_pref_source"] == "auto"
+        assert r["suggested_channel"] == "text"   # pref wins over not-opted-in
+        assert r["ever_responded"] is True
     finally:
         os.unlink(db)
 
