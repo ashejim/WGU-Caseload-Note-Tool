@@ -356,6 +356,16 @@ class BrowserWorker:
         None), schedule_name, commit."""
         self.q.put(("SEND_TEXT", payload, on_done))
 
+    def submit_start_capture(self, on_done: Callable[[dict], None]) -> None:
+        """Begin recording Salesforce DATA responses into _capture_log (generic
+        endpoint discovery — e.g. finding which Aura action the 'any course' view
+        uses). Stop + read with submit_dump_capture."""
+        self.q.put(("START_CAPTURE", on_done))
+
+    def submit_dump_capture(self, on_done: Callable[[dict], None]) -> None:
+        """Stop the generic capture and return the accumulated response log."""
+        self.q.put(("DUMP_CAPTURE", on_done))
+
     def submit_arm_text_capture(self, on_done: Callable[[dict], None]) -> None:
         """Attach a persistent network recorder to the open Mongoose tab (tool
         AND manual sends) for the text-send API discovery."""
@@ -841,6 +851,19 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._send_text(ctx, payload)
+            finally:
+                on_done(res)
+        elif cmd[0] == "START_CAPTURE":
+            _, on_done = cmd
+            try:
+                self.start_request_capture()
+            finally:
+                on_done({"ok": True})
+        elif cmd[0] == "DUMP_CAPTURE":
+            _, on_done = cmd
+            res = {}
+            try:
+                res = {"log": self.stop_request_capture()}
             finally:
                 on_done(res)
         elif cmd[0] == "ARM_TEXT_CAPTURE":

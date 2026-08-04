@@ -6061,7 +6061,13 @@ class CaseloadPanel:
         # browser to 'any course' → a course code to see if that view exposes the
         # whole-course roster via the same feed. Read-only.
         if q.lower().startswith("coursescan"):
-            self.app._probe_grid_courses()
+            rest = q.split(":", 1)[1].strip().lower() if ":" in q else ""
+            if rest == "capture":
+                self.app._course_scan_capture()
+            elif rest == "dump":
+                self.app._course_scan_dump()
+            else:
+                self.app._probe_grid_courses()
             return "break"
         # DIAGNOSTIC: "griddiff:" compares the intercepted grid JSON against the
         # CSV column by column (writes griddiff_report.txt) — proves whether the
@@ -22602,6 +22608,48 @@ class App:
                     f"  sample {course} {sid} fields: "
                     + ", ".join(f"{k}={str(row.get(k))[:20]!r}" for k in keys[:7]))
                 break
+
+    def _course_scan_capture(self) -> None:
+        """Arm generic SF-response capture to discover which endpoint the caseload
+        browser's 'any course' view uses (it isn't getCaseLoadMainGridData)."""
+        def on_done(_r):
+            self.root.after(0, lambda: self._append_log(
+                "Course-scan capture ARMED. Now: in the browser switch to 'any "
+                "course' → C769, SCROLL the list to load rows, then type "
+                "'coursescan: dump'."))
+        self.worker.submit_start_capture(on_done)
+
+    def _course_scan_dump(self) -> None:
+        """Stop capture; report which responses carry a student roster and write
+        the full bodies to coursescan_report.txt for inspection."""
+        def on_done(res):
+            def render():
+                log = (res or {}).get("log") or []
+                cands = []
+                for e in log:
+                    body = e.get("body_preview") or ""
+                    n = body.count("StudentID")
+                    if n:
+                        cands.append((n, e.get("url", ""), e.get("body_len", 0)))
+                cands.sort(reverse=True)
+                self._append_log(
+                    f"Course-scan dump: {len(log)} data responses; "
+                    f"{len(cands)} carry StudentID.")
+                for n, url, blen in cands[:8]:
+                    self._append_log(f"  {n}× StudentID · {blen}b · {url[:80]}")
+                try:
+                    path = USER_CONFIG_DIR / "coursescan_report.txt"
+                    with open(path, "w", encoding="utf-8") as f:
+                        for e in log:
+                            f.write(f"=== {e.get('url')} (status "
+                                    f"{e.get('status')}, {e.get('body_len')}b, "
+                                    f"{e.get('content_type')}) ===\n")
+                            f.write((e.get("body_preview") or "")[:12000] + "\n\n")
+                    self._append_log(f"  ↳ full capture → {path}")
+                except Exception as ex:
+                    self._append_log(f"  (write failed: {ex})", error=True)
+            self.root.after(0, render)
+        self.worker.submit_dump_capture(on_done)
 
     def _reapply_notes_font(self, size=None) -> None:
         p = getattr(self, "caseload_panel", None)
