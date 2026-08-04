@@ -87,6 +87,14 @@ class BrowserWorker:
         # archive's (passed-student) rows don't pollute the My-Students grid
         # (pass/fail + contact-id map). See _download_outcomes_archive.
         self._suppress_grid_capture = False
+        # Set while capturing the WHOLE-COURSE 'any course' roster (coursescan):
+        # those getCaseLoadMainGridData pages carry OTHER instructors' students,
+        # so they must NOT merge into the My-Students grid (which builds the
+        # caseload — merging them would balloon the caseload to the whole course
+        # and a batch could fire to hundreds). They accumulate into _roster_data
+        # instead. See _probe_course_capture / roster_rows_by_key.
+        self._capture_to_roster = False
+        self._roster_data: Optional[dict] = None
         # EA dashboard JSON feed: while _ea_capture_armed (set around the EA
         # dashboard navigation), _on_response accumulates the EmployeeEvent__c
         # records the page fetches into _ea_data — so EAs can be read from JSON
@@ -2339,18 +2347,22 @@ class BrowserWorker:
         import time as _t
         target = self._active_page(ctx)
         self.start_request_capture()
+        self._capture_to_roster = True   # keep roster pages OUT of the caseload grid
         self.on_status(
             f"Course capture: recording for {int(seconds)}s — switch the browser "
             "to 'any course' → C769 and SCROLL the list NOW…")
         t0 = _t.time()
-        while _t.time() - t0 < float(seconds):
-            try:
-                if target is not None:
-                    target.wait_for_timeout(500)   # pumps pending response events
-                else:
-                    _t.sleep(0.5)
-            except Exception:
-                break
+        try:
+            while _t.time() - t0 < float(seconds):
+                try:
+                    if target is not None:
+                        target.wait_for_timeout(500)   # pumps response events
+                    else:
+                        _t.sleep(0.5)
+                except Exception:
+                    break
+        finally:
+            self._capture_to_roster = False
         return {"log": self.stop_request_capture()}
 
     def _on_request(self, request) -> None:
@@ -2511,7 +2523,11 @@ class BrowserWorker:
                 break
         if not rows:
             return
-        store = self._grid_data or {"by_key": {}, "ts": 0.0}
+        # Route whole-course roster pages to a SEPARATE store so they never
+        # pollute the My-Students grid (the caseload source).
+        to_roster = self._capture_to_roster
+        store = (self._roster_data if to_roster else self._grid_data) \
+            or {"by_key": {}, "ts": 0.0}
         by_key = store["by_key"]
         for row in rows:
             sid = str(row.get("StudentID") or "").strip()
@@ -2520,7 +2536,10 @@ class BrowserWorker:
             course = str(row.get("CourseCode") or "").strip()
             by_key[(sid, course)] = row
         store["ts"] = time.time()
-        self._grid_data = store   # silent — the scan's result line reports it
+        if to_roster:
+            self._roster_data = store
+        else:
+            self._grid_data = store   # silent — the scan's result line reports it
 
     def _harvest_aura_creds(self, request) -> None:
         """Pull aura.token + aura.context out of an Aura POST body and keep the
@@ -3043,13 +3062,23 @@ class BrowserWorker:
                 f"{str(err)[:200] or body[:200]}"}
 
     def grid_rows_by_key(self) -> dict:
-        """The accumulated caseload-grid rows keyed by (StudentID, CourseCode).
+        """The accumulated MY-CASELOAD grid rows keyed by (StudentID, CourseCode).
         {} if no grid captured yet. Shallow copy — the App reads it on reload to
-        layer the grid's rich fields onto the CSV rows."""
+        layer the grid's rich fields onto the CSV rows. Does NOT include the
+        whole-course roster (coursescan) — that's kept separate so it can't inflate
+        the caseload; see roster_rows_by_key."""
         grid = self._grid_data
         if not grid:
             return {}
         return dict(grid.get("by_key") or {})
+
+    def roster_rows_by_key(self) -> dict:
+        """The whole-course roster rows captured via 'coursescan: capture' (all
+        instructors), kept SEPARATE from the caseload grid. {} if none captured."""
+        r = self._roster_data
+        if not r:
+            return {}
+        return dict(r.get("by_key") or {})
 
     def grid_student_contact_map(self) -> dict:
         """{StudentID: contactID} harvested from the accumulated caseload grid

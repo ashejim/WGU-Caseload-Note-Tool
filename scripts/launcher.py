@@ -22662,10 +22662,10 @@ class App:
         view fires the same getCaseLoadMainGridData feed (so we can capture the
         whole-course roster — all faculty — for free)."""
         from collections import Counter
-        grid = self.worker.grid_rows_by_key()
+        grid = self.worker.roster_rows_by_key() or self.worker.grid_rows_by_key()
         if not grid:
-            self._append_log("Grid capture is empty — load the caseload first.",
-                             error=True)
+            self._append_log("No roster captured yet — run 'coursescan: capture' "
+                             "on the any-course view first.", error=True)
             return
         by_course, cid_by = Counter(), Counter()
         for (sid, course), row in grid.items():
@@ -22696,9 +22696,9 @@ class App:
         AssignmentType, pass-color, Momentum, etc. Scalar fields only."""
         import json as _json
         from collections import Counter
-        grid = self.worker.grid_rows_by_key()
+        grid = self.worker.roster_rows_by_key()
         if not grid:
-            self._append_log("Grid capture is empty — run 'coursescan: capture' "
+            self._append_log("No roster captured — run 'coursescan: capture' "
                              "while on the any-course view first.", error=True)
             return
         rows = [{k: v for k, v in r.items() if not isinstance(v, (dict, list))}
