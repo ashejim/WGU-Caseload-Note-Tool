@@ -6068,6 +6068,8 @@ class CaseloadPanel:
                 if len(parts) > 1 and parts[1].isdigit():
                     secs = max(15, min(180, int(parts[1])))
                 self.app._course_scan_capture(secs)
+            elif parts and parts[0] == "export":
+                self.app._course_scan_export()
             else:
                 self.app._probe_grid_courses()
             return "break"
@@ -22610,6 +22612,32 @@ class App:
                     f"  sample {course} {sid} fields: "
                     + ", ".join(f"{k}={str(row.get(k))[:20]!r}" for k in keys[:7]))
                 break
+
+    def _course_scan_export(self) -> None:
+        """Dump the accumulated caseload-grid rows (Jim's + any whole-course
+        roster captured via 'coursescan: capture') to coursescan_roster.json for
+        offline team-wide analysis — StudentID, contactID, CourseCode,
+        AssignmentType, pass-color, Momentum, etc. Scalar fields only."""
+        import json as _json
+        from collections import Counter
+        grid = self.worker.grid_rows_by_key()
+        if not grid:
+            self._append_log("Grid capture is empty — run 'coursescan: capture' "
+                             "while on the any-course view first.", error=True)
+            return
+        rows = [{k: v for k, v in r.items() if not isinstance(v, (dict, list))}
+                for r in grid.values()]
+        try:
+            path = USER_CONFIG_DIR / "coursescan_roster.json"
+            with open(path, "w", encoding="utf-8") as f:
+                _json.dump(rows, f)
+        except Exception as ex:
+            self._append_log(f"Export failed: {ex}", error=True)
+            return
+        by_course = Counter(r.get("CourseCode") for r in rows)
+        self._append_log(f"Exported {len(rows)} grid rows → {path}")
+        for c, n in by_course.most_common(8):
+            self._append_log(f"  {c}: {n}")
 
     def _course_scan_capture(self, seconds: int = 60) -> None:
         """Record SF data responses for `seconds` while you manually switch the
