@@ -163,6 +163,53 @@ def test_sweep_change_gate():
         os.unlink(db)
 
 
+def test_departed_students_for_sweep():
+    db = _tmp_db()
+    try:
+        conn = history._connect(db)
+        with conn:
+            # contact_ids is owned by mongoose_contacts (sibling table); create
+            # a minimal version so the join has something to read.
+            conn.execute("CREATE TABLE IF NOT EXISTS contact_ids "
+                         "(student_id TEXT PRIMARY KEY, contact_id TEXT, "
+                         "name TEXT, updated_at TEXT)")
+            # two resolved students; 999 has two course outcomes (dedupe to one)
+            conn.execute("INSERT INTO outcomes (student_id, course_code, name, "
+                         "outcome, last_ingest_at) VALUES "
+                         "('999','C769','Ada Byron','passed','2026-08-01')")
+            conn.execute("INSERT INTO outcomes (student_id, course_code, name, "
+                         "outcome, last_ingest_at) VALUES "
+                         "('999','D502','Ada Byron','passed','2026-08-02')")
+            conn.execute("INSERT INTO outcomes (student_id, course_code, name, "
+                         "outcome, last_ingest_at) VALUES "
+                         "('888','C964','Bob Noyce','not_passed','2026-08-01')")
+            # 999 has a stored contact id; 888 does not
+            conn.execute("INSERT INTO contact_ids (student_id, contact_id) "
+                         "VALUES ('999','0031')")
+        conn.close()
+
+        got = history.departed_students_for_sweep(db_path=db)
+        by = {s["student_id"]: s for s in got}
+        assert set(by) == {"999", "888"}, set(by)          # deduped by student
+        assert by["999"]["contact_id"] == "0031"
+        assert by["888"]["contact_id"] == ""               # search fallback
+        assert all(s["last_contact"] == "" for s in got)   # static → gate on "no notes"
+
+        # change-gate: initially both need a sweep (no notes yet)
+        need0 = {s["student_id"] for s in
+                 history.students_needing_note_sweep(got, db_path=db)}
+        assert need0 == {"999", "888"}, need0
+        # once 888 (no contact id) has a note stored, it gates out by student_id
+        history.persist_notes(
+            [_note(url="", date="2026-05-01T09:00:00Z")],
+            student_id="888", contact_id="", db_path=db)
+        need1 = {s["student_id"] for s in
+                 history.students_needing_note_sweep(got, db_path=db)}
+        assert need1 == {"999"}, need1
+    finally:
+        os.unlink(db)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

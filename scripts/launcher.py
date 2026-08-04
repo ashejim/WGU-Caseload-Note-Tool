@@ -6042,16 +6042,19 @@ class CaseloadPanel:
         if q.lower().startswith("textapi"):
             self.app._arm_text_capture()
             return "break"
-        # Phase 1b: "sweepnotes:" scrapes the caseload's note threads into the
-        # local contact-history DB (change-gated — only students contacted since
-        # the last sweep). "sweepnotes: cancel" stops; "sweepnotes: force"
-        # re-scrapes everyone. Drives the browser — best run while away.
+        # Phase 1b: "sweepnotes:" scrapes note threads into the local contact-
+        # history DB (change-gated). Modifiers (space-separated): "departed"
+        # sweeps resolved/departed students instead of the live caseload; "force"
+        # re-scrapes everyone; "cancel" stops. Drives the browser — run while away.
         if q.lower().startswith("sweepnotes"):
             rest = q.split(":", 1)[1].strip().lower() if ":" in q else ""
-            if rest == "cancel":
+            parts = rest.split()
+            if "cancel" in parts:
                 self.app._cancel_note_sweep()
             else:
-                self.app._sweep_note_history(force=(rest == "force"))
+                scope = "departed" if "departed" in parts else "caseload"
+                self.app._sweep_note_history(
+                    force=("force" in parts), scope=scope)
             return "break"
         # DIAGNOSTIC: "griddiff:" compares the intercepted grid JSON against the
         # CSV column by column (writes griddiff_report.txt) — proves whether the
@@ -22447,33 +22450,49 @@ class App:
                 cid = ""
         return cid
 
-    def _sweep_note_history(self, *, force: bool = False) -> None:
-        """Scrape the caseload's note threads into history.notes. `force` skips
-        the change-gate (re-scrape everyone)."""
+    def _sweep_note_history(self, *, force: bool = False,
+                            scope: str = "caseload") -> None:
+        """Scrape note threads into history.notes. ``scope='caseload'`` (default)
+        sweeps the live caseload; ``scope='departed'`` sweeps resolved/departed
+        students (from outcomes, deep-linked by their stored Contact id, else a
+        Student-ID search). ``force`` skips the change-gate (re-scrape everyone)."""
         if getattr(self, "_note_sweep_active", False):
             self._append_log("Note sweep already running — type "
                              "'sweepnotes: cancel' to stop.")
             return
-        rows = self._caseload_rows or []
-        if not rows:
-            self._append_log("Note sweep: no caseload loaded.", error=True)
-            return
-        students, seen = [], set()
-        for r in rows:
-            sid = (r.get("StudentID") or "").strip()
-            if not sid or sid in seen:
-                continue
-            seen.add(sid)
-            last_contact = max((r.get("CourseContact") or "").strip(),
-                               (r.get("LastSMContact") or "").strip())
-            students.append({
-                "student_id": sid, "contact_id": self._contact_id_for(sid),
-                "name": (r.get("Name") or sid), "last_contact": last_contact})
+        if scope == "departed":
+            students = history.departed_students_for_sweep()
+            # A resolved student who's somehow back on the live caseload belongs
+            # to the caseload sweep, not here.
+            live = {(r.get("StudentID") or "").strip()
+                    for r in (self._caseload_rows or [])}
+            students = [s for s in students if s["student_id"] not in live]
+            if not students:
+                self._append_log("Note sweep (departed): no resolved students "
+                                 "found — ingest the passed-outcomes archive first.",
+                                 error=True)
+                return
+        else:
+            rows = self._caseload_rows or []
+            if not rows:
+                self._append_log("Note sweep: no caseload loaded.", error=True)
+                return
+            students, seen = [], set()
+            for r in rows:
+                sid = (r.get("StudentID") or "").strip()
+                if not sid or sid in seen:
+                    continue
+                seen.add(sid)
+                last_contact = max((r.get("CourseContact") or "").strip(),
+                                   (r.get("LastSMContact") or "").strip())
+                students.append({
+                    "student_id": sid, "contact_id": self._contact_id_for(sid),
+                    "name": (r.get("Name") or sid), "last_contact": last_contact})
         worklist = (students if force
                     else history.students_needing_note_sweep(students))
         if not worklist:
-            self._append_log(f"Note sweep: all {len(students)} students already "
-                             "current — nothing to scrape.")
+            self._append_log(f"Note sweep ({scope}): all {len(students)} students "
+                             "already captured — nothing to scrape.")
             return
         self._note_sweep_active = True
         self._note_sweep_cancel = False
@@ -22481,9 +22500,9 @@ class App:
         self._note_sweep_total = len(worklist)
         self._note_sweep_stats = {"done": 0, "stored": 0, "errors": 0}
         self._append_log(
-            f"▶ Note sweep started: {len(worklist)} of {len(students)} students "
-            "need scraping (change-gated). This drives the browser — best run "
-            "while away. Type 'sweepnotes: cancel' to stop.")
+            f"▶ Note sweep ({scope}) started: {len(worklist)} of {len(students)} "
+            "students need scraping (change-gated). This drives the browser — best "
+            "run while away. Type 'sweepnotes: cancel' to stop.")
         self._sweep_next_student()
 
     def _sweep_next_student(self) -> None:

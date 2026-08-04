@@ -704,6 +704,37 @@ def notes_last_stored(*, db_path=HISTORY_DB) -> dict:
         conn.close()
 
 
+def departed_students_for_sweep(*, db_path=HISTORY_DB) -> list:
+    """Resolved (departed) students for a note sweep — one row per student_id,
+    with their stored Contact id (from the contact_ids map) when known, else ''
+    (the sweep then falls back to a Student-ID search). ``last_contact`` is left
+    blank so the change-gate keeps only students we have NO notes for yet: a
+    departed student's thread is static, so once captured it never needs
+    re-scraping."""
+    conn = _connect(db_path)
+    try:
+        # contact_ids is owned by src/mongoose_contacts (same DB); tolerate its
+        # absence — a missing id just means the sweep searches by Student ID.
+        try:
+            cids = {r["student_id"]: r["contact_id"] for r in conn.execute(
+                "SELECT student_id, contact_id FROM contact_ids "
+                "WHERE contact_id != ''")}
+        except sqlite3.OperationalError:
+            cids = {}
+        seen, out = set(), []
+        for r in conn.execute(
+                "SELECT student_id, name FROM outcomes ORDER BY last_ingest_at DESC"):
+            sid = r["student_id"]
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            out.append({"student_id": sid, "contact_id": cids.get(sid, ""),
+                        "name": r["name"] or sid, "last_contact": ""})
+        return out
+    finally:
+        conn.close()
+
+
 def students_needing_note_sweep(students, *, db_path=HISTORY_DB,
                                 _stored=None) -> list:
     """Change-gate a note sweep: from ``students`` (dicts with at least
@@ -716,13 +747,21 @@ def students_needing_note_sweep(students, *, db_path=HISTORY_DB,
     ``_stored`` (a pre-fetched notes_last_stored dict) is a seam for tests / to
     avoid re-querying when the caller already has it."""
     stored = notes_last_stored(db_path=db_path) if _stored is None else _stored
+    # student_id-keyed high-water for rows lacking a contact id (departed
+    # students often have no stored contact id — gate them by student_id so a
+    # re-run skips ones we've already captured).
+    conn = _connect(db_path)
+    try:
+        by_sid = {r["student_id"]: r["newest"] for r in conn.execute(
+            "SELECT student_id, MAX(created_at) AS newest FROM notes "
+            "WHERE student_id != '' GROUP BY student_id") if r["newest"]}
+    finally:
+        conn.close()
     out = []
     for s in students:
         cid = (s.get("contact_id") or "").strip()
-        if not cid:
-            out.append(s)            # can't gate without an id — best-effort include
-            continue
-        newest = stored.get(cid)
+        sid = (s.get("student_id") or "").strip()
+        newest = stored.get(cid) if cid else by_sid.get(sid)
         last_contact = (s.get("last_contact") or "").strip()
         if newest is None or (last_contact and last_contact > newest):
             out.append(s)
