@@ -6052,7 +6052,8 @@ class CaseloadPanel:
             if "cancel" in parts:
                 self.app._cancel_note_sweep()
             else:
-                scope = "departed" if "departed" in parts else "caseload"
+                scope = ("departed" if "departed" in parts
+                         else "peers" if "peers" in parts else "caseload")
                 self.app._sweep_note_history(
                     force=("force" in parts), scope=scope)
             return "break"
@@ -6060,6 +6061,12 @@ class CaseloadPanel:
         # accumulated (by course + contact-id coverage). Run after switching the
         # browser to 'any course' → a course code to see if that view exposes the
         # whole-course roster via the same feed. Read-only.
+        # "ledger:<StudentID>" — show the per-student contact ledger (what's been
+        # tried, what they respond to, cost-aware suggestion for what to try next).
+        if q.lower().startswith("ledger"):
+            sid = q.split(":", 1)[1].strip() if ":" in q else ""
+            self.app._show_engagement_ledger(sid)
+            return "break"
         if q.lower().startswith("coursescan"):
             rest = q.split(":", 1)[1].strip().lower() if ":" in q else ""
             parts = rest.split()
@@ -22452,6 +22459,37 @@ class App:
     # a deliberate, cancellable action ('sweepnotes:' / 'sweepnotes: cancel').
     _NOTE_SWEEP_THROTTLE_MS = 900
 
+    def _peer_roster_students(self) -> list:
+        """Peer-instructors' students from the exported team roster
+        (coursescan_roster.json) — everyone assigned to a REAL mentor other than
+        me (excludes unassigned). Returns None if the roster hasn't been exported.
+        Used by the scoped peer-strategy study."""
+        import json as _json
+        from collections import Counter
+        path = USER_CONFIG_DIR / "coursescan_roster.json"
+        if not path.exists():
+            return None
+        try:
+            roster = _json.load(open(path, encoding="utf-8"))
+        except Exception:
+            return None
+        # My own mentor name = the dominant CourseMentor on my live caseload.
+        own = Counter((r.get("CourseMentor") or "").strip()
+                      for r in (self._caseload_rows or [])
+                      if (r.get("CourseMentor") or "").strip())
+        own_name = own.most_common(1)[0][0] if own else ""
+        out, seen = [], set()
+        for r in roster:
+            m = (r.get("CourseMentor") or "").strip()
+            sid = (r.get("StudentID") or "").strip()
+            if not sid or sid in seen or not m or m in ("None", own_name):
+                continue
+            seen.add(sid)
+            out.append({"student_id": sid,
+                        "contact_id": (r.get("contactID") or "").strip(),
+                        "name": sid, "last_contact": ""})
+        return out
+
     def _contact_id_for(self, sid) -> str:
         """Best-effort Contact id for a Student id (segment/grid map, then the
         complete grid Student->Contact map)."""
@@ -22477,7 +22515,19 @@ class App:
             self._append_log("Note sweep already running — type "
                              "'sweepnotes: cancel' to stop.")
             return
-        if scope == "departed":
+        if scope == "peers":
+            students = self._peer_roster_students()
+            if students is None:
+                self._append_log(
+                    "Peer sweep: no coursescan_roster.json — run 'coursescan: "
+                    "capture' (on the any-course view) then 'coursescan: export' "
+                    "first.", error=True)
+                return
+            if not students:
+                self._append_log("Peer sweep: no peer students found in the "
+                                 "roster.", error=True)
+                return
+        elif scope == "departed":
             students = history.departed_students_for_sweep()
             # A resolved student who's somehow back on the live caseload belongs
             # to the caseload sweep, not here.
@@ -22570,7 +22620,8 @@ class App:
                 pass
         self.worker.submit_fetch_notes(
             s["student_id"], on_done, contact_id=s["contact_id"],
-            off_caseload=(getattr(self, "_note_sweep_scope", "") == "departed"))
+            off_caseload=(getattr(self, "_note_sweep_scope", "")
+                          in ("departed", "peers")))
 
     def _cancel_note_sweep(self) -> None:
         if getattr(self, "_note_sweep_active", False):
@@ -22578,6 +22629,31 @@ class App:
             self._append_log("Note sweep: cancelling after the current student…")
         else:
             self._append_log("No note sweep is running.")
+
+    def _show_engagement_ledger(self, sid: str) -> None:
+        """Print the per-student engagement ledger: channel usage + response, and
+        the cost-aware 'what to try next' suggestion (history.engagement_ledger)."""
+        sid = (sid or "").strip()
+        if not sid.isdigit():
+            self._append_log("Usage: ledger:<StudentID>", error=True)
+            return
+        led = history.engagement_ledger(sid)
+        ch = led["channels"]
+        if not ch:
+            self._append_log(f"📇 Ledger {sid}: no contact history captured yet "
+                             "(sweep this student's notes first).")
+            return
+        parts = []
+        for c in ("text", "email", "call"):
+            if c in ch:
+                i = ch[c]
+                rr = (f"{i['response_rate']*100:.0f}%"
+                      if i["response_rate"] is not None else "—")
+                parts.append(f"{c} {i['out']}↗/{i['in']}↩ (reply {rr})")
+        self._append_log(f"📇 Ledger {sid}: " + "  ·  ".join(parts))
+        self._append_log(
+            f"   responds to: {', '.join(led['responds_to']) or 'nothing yet'}"
+            f"  →  SUGGEST: {led['suggested_next'].upper()} — {led['reason']}")
 
     def _probe_grid_courses(self) -> None:
         """Read-only: report what the live caseload-grid feed has accumulated,

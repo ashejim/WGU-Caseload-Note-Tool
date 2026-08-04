@@ -768,6 +768,81 @@ def students_needing_note_sweep(students, *, db_path=HISTORY_DB,
     return out
 
 
+# ----------------------------------------------------------------------
+# engagement ledger — per-student channel strategy (what's tried / what works)
+# ----------------------------------------------------------------------
+# Contact channels by escalation COST (low → high): a boilerplate text is cheap,
+# a personal email costs more, a cold call is the last resort. 'note'/'chatter'
+# are internal, not outreach — excluded from the ledger.
+_CHANNEL_COST = {"text": 1, "email": 2, "call": 3}
+_CHANNEL_ORDER = ("text", "email", "call")
+
+
+def engagement_ledger(student_id: str, *, db_path=HISTORY_DB,
+                      now: Optional[datetime] = None) -> dict:
+    """Per-student contact strategy from the note history: for each channel
+    (text/email/call) how many outbound/inbound and when, whether the student
+    RESPONDS on it, and a cost-aware suggestion for what to try next — prefer the
+    cheapest channel they answer; if they've never answered, escalate to the next
+    untried tier (don't cold-call until cheaper channels are exhausted). Returns
+    {student_id, channels:{ch:{out,in,last_out,last_in,responds,response_rate}},
+    responds_to:[…], tried:[…], last_inbound, suggested_next, reason}."""
+    from collections import defaultdict
+    today = (now or datetime.now()).date()
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT channel, direction, created_at FROM notes "
+            "WHERE student_id = ? AND created_at != ''", (student_id,)).fetchall()
+    finally:
+        conn.close()
+
+    ch = defaultdict(lambda: {"out": 0, "in": 0, "last_out": "", "last_in": ""})
+    for r in rows:
+        c = r["channel"]
+        if c not in _CHANNEL_COST:
+            continue
+        t = r["created_at"]
+        if r["direction"] == "outbound":
+            ch[c]["out"] += 1
+            ch[c]["last_out"] = max(ch[c]["last_out"], t)
+        elif r["direction"] == "inbound":
+            ch[c]["in"] += 1
+            ch[c]["last_in"] = max(ch[c]["last_in"], t)
+
+    channels = {}
+    for c, info in ch.items():
+        channels[c] = dict(
+            info, responds=info["in"] > 0,
+            response_rate=(info["in"] / info["out"]) if info["out"] else None)
+    responds_to = sorted((c for c in channels if channels[c]["responds"]),
+                         key=lambda c: _CHANNEL_COST[c])
+    tried = sorted((c for c in channels if channels[c]["out"] > 0),
+                   key=lambda c: _CHANNEL_COST[c])
+    last_inbound = max((channels[c]["last_in"] for c in channels
+                        if channels[c]["last_in"]), default="")
+
+    if responds_to:
+        nxt = responds_to[0]                       # cheapest channel they answer
+        reason = f"replies on {nxt} — use it"
+    else:
+        untried = [c for c in _CHANNEL_ORDER if c not in tried]
+        if not tried:
+            nxt, reason = "text", "no contact yet — start low-cost (text)"
+        elif untried:
+            nxt = untried[0]
+            reason = (f"no reply to {'/'.join(tried)} — escalate to {nxt}")
+        else:
+            nxt = "call"
+            reason = "tried every channel, no reply — call is the last resort"
+
+    return {
+        "student_id": student_id, "channels": channels,
+        "responds_to": responds_to, "tried": tried,
+        "last_inbound": last_inbound, "suggested_next": nxt, "reason": reason,
+    }
+
+
 def _departures_vs_prior_day(cur: sqlite3.Cursor, today: str,
                              incoming_keys: set):
     """(departures, prior_row_count) comparing the most recent collection from
