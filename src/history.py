@@ -1431,16 +1431,17 @@ def at_risk_students(*, db_path=HISTORY_DB, now: Optional[datetime] = None,
       1. **course underway** — CourseStatus not 'Planned', start in the past;
       2. **never attempted a task** — the causal risk (attempt ≈ pass, §12);
       3. **enrolled ≥ ``min_weeks``** — a real stall, not a fresh student who'll
-         self-start (§8/§15 time-weighting);
+         self-start (§8/§15 time-weighting). Measured from **CourseStartDate**
+         (time in THIS registration), NOT the ``weeksincourse`` field, which
+         counts tenure across prior terms and wrongly flags freshly term-rolled
+         students as long stalls;
       4. **not already resolved** (passed / not-passed in outcomes).
 
-    Each row is an actionable worklist entry: urgency (term days left), how long
-    they've stalled (weeks enrolled), whether they're being missed (days since
-    contact), how to reach them (reachable channels + opt-in), the ledger-backed
-    ``suggested_channel`` and their ``contact_pref`` (manual override else the
-    channel they engage on), plus ``ever_responded`` and ``other_courses``.
-    Sorted by urgency: soonest deadline, then longest-enrolled, then longest since
-    contact (the most-neglected first)."""
+    Each row is an actionable worklist entry (see _actionable_fields) plus
+    ``weeks_enrolled`` / ``days_into_course``. Sorted by urgency: soonest
+    deadline, then longest-enrolled, then longest since contact (most-neglected).
+    NOTE: superseded in the UI by momentum_risk_students(); retained as the
+    never-attempted stall query."""
     today = (now or datetime.now()).date()
     conn = _connect(db_path)
     try:
@@ -1473,46 +1474,16 @@ def at_risk_students(*, db_path=HISTORY_DB, now: Optional[datetime] = None,
         # gate 2: never attempted a task
         if _has_attempted(r["latest_task_status"], e):
             continue
-        # gate 3: enrolled long enough to be a real stall
-        weeks = _to_int(_ej_get(e, "weeksincourse"))
-        if weeks is None:
-            weeks = days_into // 7
+        # gate 3: enrolled long enough (in THIS registration) to be a real stall.
+        # Use CourseStartDate, not weeksincourse (which counts prior terms).
+        weeks = days_into // 7
         if weeks < min_weeks:
             continue
 
-        sid = r["student_id"]
-        led = engagement_ledger(sid, db_path=db_path)
-        pref = contact_preference(sid, db_path=db_path, _ledger=led)
-        opted_in = _ej_get(e, "TextingPreference") == "Opted In"
-        has_email = bool(_ej_get(e, "StudentEmail"))
-        reachable = [c for c, ok in (("text", opted_in), ("email", has_email)) if ok]
-        ever_responded = any(
-            (info.get("in", 0) or (info.get("out", 0) if c == "call" else 0))
-            for c, info in led.get("channels", {}).items())
-        # what to lead with: their preference; else text if reachable (§15 —
-        # disengaged respond 68–80% to text); else email.
-        suggested = pref["pref"] or ("text" if opted_in else "email")
-
-        out.append({
-            "name": r["name"] or "",
-            "student_id": sid,
-            "course_code": r["course_code"],
-            "momentum": r["momentum"] or "",
-            "weeks_enrolled": weeks,
-            "days_into_course": days_into,
-            "term_days_left": _to_int(_ej_get(e, "TermDaysLeft")),
-            "days_since_contact": _to_int(
-                _ej_get(e, "DaysSinceLastCourseContact")),
-            "other_courses": count_other_courses(
-                _ej_get(e, "OtherCourses"), r["course_code"]),
-            "reachable": "+".join(reachable) if reachable else "—",
-            "opted_in_text": opted_in,
-            "contact_pref": pref["pref"],
-            "contact_pref_source": pref["source"],
-            "suggested_channel": suggested,
-            "ever_responded": ever_responded,
-            "ic_end": _ej_get(e, "Icenddate"),
-        })
+        row = _actionable_fields(r, e, db_path=db_path)
+        row["weeks_enrolled"] = weeks
+        row["days_into_course"] = days_into
+        out.append(row)
     out.sort(key=lambda a: (
         a["term_days_left"] if a["term_days_left"] is not None else 1 << 30,
         -(a["weeks_enrolled"] or 0), -(a["days_since_contact"] or 0)))
@@ -1531,11 +1502,12 @@ def at_risk_students(*, db_path=HISTORY_DB, now: Optional[datetime] = None,
 _CHASE_STATUSES = {"contacted", "dismissed"}
 
 
-def sync_chase_list(*, db_path=HISTORY_DB,
+def sync_chase_list(live: list[dict], *, db_path=HISTORY_DB,
                     now: Optional[datetime] = None) -> list[dict]:
-    """Recompute the live chase list and reconcile it against the persistent
-    ``chase_list`` ledger, then return the live rows enriched with the persisted
-    fields (``first_listed_at``, ``days_on_list``, ``chase_status``,
+    """Reconcile a freshly-computed worklist (``live`` — the rows from
+    momentum_risk_students / at_risk_students) against the persistent
+    ``chase_list`` ledger, then return those rows enriched IN PLACE with the
+    persisted fields (``first_listed_at``, ``days_on_list``, ``chase_status``,
     ``status_at``).
 
     Reconciliation in one pass:
@@ -1544,12 +1516,11 @@ def sync_chase_list(*, db_path=HISTORY_DB,
         cleared (they are back / still here) — first_listed_at and the manual
         status are preserved (a dismissed student STAYS dismissed until you
         clear it);
-      * one previously listed but no longer qualifying gets resolved_at = now
-        (they left the worklist — attempted a task or the outcome resolved).
+      * one previously listed but no longer present gets resolved_at = now
+        (they left the worklist — passed / departed / no longer scored).
     """
     ts = now or datetime.now()
     ts_iso = ts.isoformat(timespec="seconds")
-    live = at_risk_students(db_path=db_path, now=ts)
     live_keys = {(r["student_id"], r["course_code"]) for r in live}
 
     conn = _connect(db_path)
@@ -1619,16 +1590,218 @@ def set_chase_status(student_id: str, course_code: str, status: str, *,
         conn.close()
 
 
-def chase_worklist(*, db_path=HISTORY_DB, now: Optional[datetime] = None,
+def chase_worklist(*, window_weeks: Optional[int] = None, db_path=HISTORY_DB,
+                   now: Optional[datetime] = None,
                    include_dismissed: bool = False) -> list[dict]:
-    """The chase list as a persistent worklist: syncs membership then returns
-    the enriched live rows, hiding dismissed students unless
+    """The momentum-risk targeting list as a persistent worklist: computes the
+    ranked rows (momentum_risk_students over ``window_weeks``), reconciles
+    membership/status, then returns them — hiding dismissed students unless
     ``include_dismissed``. Dismissed rows keep chase_status='dismissed' so the
     caller can grey them."""
-    rows = sync_chase_list(db_path=db_path, now=now)
+    rows = momentum_risk_students(window_weeks=window_weeks, db_path=db_path,
+                                  now=now)
+    rows = sync_chase_list(rows, db_path=db_path, now=now)
     if not include_dismissed:
         rows = [r for r in rows if r.get("chase_status") != "dismissed"]
     return rows
+
+
+def _actionable_fields(r, e, *, db_path=HISTORY_DB, led=None) -> dict:
+    """The common actionable-worklist fields for a caseload snapshot row: how to
+    reach them (reachable channels + opt-in), the ledger-backed suggested channel
+    and contact preference (manual override else the channel they engage on),
+    whether they've ever replied, and the urgency/neglect metrics. Shared by
+    at_risk_students() and momentum_risk_students()."""
+    sid = r["student_id"]
+    led = led if led is not None else engagement_ledger(sid, db_path=db_path)
+    pref = contact_preference(sid, db_path=db_path, _ledger=led)
+    opted_in = _ej_get(e, "TextingPreference") == "Opted In"
+    has_email = bool(_ej_get(e, "StudentEmail"))
+    reachable = [c for c, ok in (("text", opted_in), ("email", has_email)) if ok]
+    ever_responded = any(
+        (info.get("in", 0) or (info.get("out", 0) if c == "call" else 0))
+        for c, info in led.get("channels", {}).items())
+    # what to lead with: their preference; else text if opted-in (§15 — disengaged
+    # respond 68–80% to text); else email.
+    suggested = pref["pref"] or ("text" if opted_in else "email")
+    return {
+        "name": r["name"] or "",
+        "student_id": sid,
+        "course_code": r["course_code"],
+        "momentum": r["momentum"] or "",
+        "term_days_left": _to_int(_ej_get(e, "TermDaysLeft")),
+        "days_since_contact": _to_int(_ej_get(e, "DaysSinceLastCourseContact")),
+        "other_courses": count_other_courses(
+            _ej_get(e, "OtherCourses"), r["course_code"]),
+        "reachable": "+".join(reachable) if reachable else "—",
+        "opted_in_text": opted_in,
+        "contact_pref": pref["pref"],
+        "contact_pref_source": pref["source"],
+        "suggested_channel": suggested,
+        "ever_responded": ever_responded,
+        "ic_end": _ej_get(e, "Icenddate"),
+    }
+
+
+# ----------------------------------------------------------------------
+# momentum-trajectory risk model (not-pass probability from momentum history)
+# ----------------------------------------------------------------------
+# FINDINGS: not-passers averaged momentum rank 2.0 and spent 69% of their time at
+# Low/Med-Low, vs passers at 4.1 / 17% — the *trajectory* separates far harder
+# than a single (noisy, ~daily-jittering) reading. We bin a student's average
+# momentum rank and map it to an empirical not-pass rate calibrated on resolved
+# outcomes. Absolute values are a FLOOR (WGU's export under-captures non-passers)
+# — trust the ordering. never-attempted is kept as a SEPARATE flag, not folded in
+# (it's a different axis, and 'resolved + never-attempted → not-passed' is nearly
+# tautological, so baking it into the score would distort it).
+_RISK_BUCKETS = [(1.5, "1.0–1.5"), (2.5, "1.5–2.5"), (3.5, "2.5–3.5"),
+                 (4.5, "3.5–4.5"), (99.0, "4.5–5.0")]
+
+
+def _avg_rank_bucket_idx(avg: float) -> int:
+    for i, (hi, _lab) in enumerate(_RISK_BUCKETS):
+        if avg < hi:
+            return i
+    return len(_RISK_BUCKETS) - 1
+
+
+def _isotonic_noninc(counts: list[tuple]) -> list[float]:
+    """Pool-adjacent-violators (PAVA): given (notpass, total) per bucket ordered
+    by ASCENDING momentum rank, return a per-bucket rate that is NON-INCREASING
+    (higher momentum ⇒ lower risk), pooling adjacent violators weighted by sample
+    size. Smooths the small-n wobble in the raw bucket rates into a monotonic fit."""
+    blocks = [{"np": np_, "tot": tot, "idx": [i]}
+              for i, (np_, tot) in enumerate(counts)]
+    i = 0
+    while i < len(blocks) - 1:
+        ri = blocks[i]["np"] / blocks[i]["tot"] if blocks[i]["tot"] else 0.0
+        rj = blocks[i + 1]["np"] / blocks[i + 1]["tot"] if blocks[i + 1]["tot"] else 0.0
+        if ri < rj - 1e-9:          # violation: rate should be non-increasing
+            blocks[i]["np"] += blocks[i + 1]["np"]
+            blocks[i]["tot"] += blocks[i + 1]["tot"]
+            blocks[i]["idx"] += blocks[i + 1]["idx"]
+            del blocks[i + 1]
+            if i > 0:
+                i -= 1
+        else:
+            i += 1
+    out = [0.0] * len(counts)
+    for b in blocks:
+        rate = b["np"] / b["tot"] if b["tot"] else 0.0
+        for idx in b["idx"]:
+            out[idx] = rate
+    return out
+
+
+def momentum_risk_calibration(*, db_path=HISTORY_DB) -> dict:
+    """Empirical not-pass probability by average-momentum-rank bucket, calibrated
+    on resolved outcomes and smoothed monotonic (PAVA). Uses each resolved
+    student's FULL momentum history (the most stable estimate). Returns
+    ``{'buckets': [label…], 'prob': [rate…], 'counts': [(notpass, total)…]}``
+    aligned to _RISK_BUCKETS. Absolute rates are a floor (see module note)."""
+    from collections import defaultdict
+    conn = _connect(db_path)
+    try:
+        series = defaultdict(list)
+        for s in conn.execute("SELECT student_id, course_code, momentum_rank "
+                              "FROM snapshots WHERE momentum_rank IS NOT NULL"):
+            series[(s["student_id"], s["course_code"])].append(s["momentum_rank"])
+        counts = [[0, 0] for _ in _RISK_BUCKETS]
+        for o in conn.execute("SELECT student_id, course_code, outcome "
+                              "FROM outcomes"):
+            h = series.get((o["student_id"], o["course_code"]))
+            if not h:
+                continue
+            bi = _avg_rank_bucket_idx(sum(h) / len(h))
+            counts[bi][1] += 1
+            if o["outcome"] == "not_passed":
+                counts[bi][0] += 1
+    finally:
+        conn.close()
+    prob = _isotonic_noninc([(c[0], c[1]) for c in counts])
+    return {"buckets": [b[1] for b in _RISK_BUCKETS], "prob": prob,
+            "counts": [tuple(c) for c in counts]}
+
+
+def momentum_risk_students(*, window_weeks: Optional[int] = None,
+                           db_path=HISTORY_DB,
+                           now: Optional[datetime] = None) -> list[dict]:
+    """The MOMENTUM-RISK targeting list: in-progress caseload students ranked by
+    modeled not-pass probability from their momentum TRAJECTORY.
+
+    ``window_weeks`` limits the trajectory to the last N weeks (None = all
+    history — most stable; shorter windows react faster to a recent slide). The
+    per-row ``risk`` is the calibrated not-pass probability for the student's
+    windowed average momentum rank. Each row also carries ``avg_momentum_rank``,
+    ``readings`` (how many snapshots backed it), ``trend`` (recent-half minus
+    earlier-half mean; >0 = recovering, so you can deprioritise climbers), a
+    ``never_attempted`` flag (a SEPARATE acute axis, not in the score), and the
+    actionable reach/suggested-channel/contact-pref fields. Sorted by risk desc,
+    then lower avg rank, then most-neglected."""
+    from collections import defaultdict
+    from datetime import timedelta
+    today = (now or datetime.now()).date()
+    calib = momentum_risk_calibration(db_path=db_path)
+    conn = _connect(db_path)
+    try:
+        latest = conn.execute("SELECT collected_at FROM collections "
+                              "ORDER BY collected_at DESC LIMIT 1").fetchone()
+        if latest is None:
+            return []
+        rows = conn.execute("SELECT * FROM snapshots WHERE collected_at = ?",
+                            (latest["collected_at"],)).fetchall()
+        resolved = {(r["student_id"], r["course_code"]) for r in
+                    conn.execute("SELECT student_id, course_code FROM outcomes")}
+        cut = None
+        if window_weeks:
+            cut = (today - timedelta(days=7 * window_weeks)).isoformat()
+        q = ("SELECT student_id, course_code, momentum_rank FROM snapshots "
+             "WHERE momentum_rank IS NOT NULL")
+        params: tuple = ()
+        if cut:
+            q += " AND collected_date >= ?"
+            params = (cut,)
+        q += " ORDER BY collected_date"
+        traj = defaultdict(list)
+        for s in conn.execute(q, params):
+            traj[(s["student_id"], s["course_code"])].append(s["momentum_rank"])
+    finally:
+        conn.close()
+
+    out = []
+    for r in rows:
+        key = (r["student_id"], r["course_code"])
+        if key in resolved:
+            continue
+        try:
+            e = json.loads(r["extra_json"] or "{}")
+        except Exception:
+            e = {}
+        status = _ej_get(e, "CourseStatus")
+        start = _parse_date(_ej_get(e, "CourseStartDate"))
+        days_into = (today - start).days if start else None
+        if status == "Planned" or days_into is None or days_into <= 0:
+            continue                              # not underway
+        h = traj.get(key) or ([r["momentum_rank"]] if r["momentum_rank"] else [])
+        if not h:
+            continue                              # no momentum reading to score
+        avg = sum(h) / len(h)
+        risk = calib["prob"][_avg_rank_bucket_idx(avg)]
+        half = len(h) // 2 or 1
+        trend = (sum(h[half:]) / max(1, len(h) - half)) - (sum(h[:half]) / half)
+        row = _actionable_fields(r, e, db_path=db_path)
+        row.update({
+            "risk": risk,
+            "avg_momentum_rank": round(avg, 2),
+            "readings": len(h),
+            "trend": round(trend, 2),
+            "never_attempted": not _has_attempted(r["latest_task_status"], e),
+            "days_into_course": days_into,
+        })
+        out.append(row)
+    out.sort(key=lambda a: (-a["risk"], a["avg_momentum_rank"],
+                            -(a["days_since_contact"] or 0)))
+    return out
 
 
 # ----------------------------------------------------------------------

@@ -69,7 +69,9 @@ def test_includes_stalled_nonattempter():
         r = rows[0]
         assert r["reachable"] == "text+email"
         assert r["suggested_channel"] == "text"   # opted-in, no known pref → text
-        assert r["weeks_enrolled"] == 10 and r["ever_responded"] is False
+        # weeks_enrolled now measures from CourseStartDate (PAST=2026-05-01 →
+        # 93 days → 13 wk), NOT the weeksincourse field.
+        assert r["weeks_enrolled"] == 13 and r["ever_responded"] is False
     finally:
         os.unlink(db)
 
@@ -83,7 +85,9 @@ def test_excludes_attempter():
 
 
 def test_excludes_fresh_enrollee():
-    db = _build(lambda c: _snap(c, "111", weeks=3))   # < min_weeks
+    # started 2 weeks ago by CourseStartDate → < min_weeks, even if the
+    # weeksincourse field (ignored now) claims a long tenure.
+    db = _build(lambda c: _snap(c, "111", start="2026-07-20", weeks=25))
     try:
         assert _ids(history.at_risk_students(db_path=db, now=NOW)) == set()
     finally:

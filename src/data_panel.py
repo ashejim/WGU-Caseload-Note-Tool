@@ -21,13 +21,13 @@ class DataPanel:
 
     # Views (label -> key). Extensible: add a builder + an entry here.
     _VIEWS = {"Pass rate vs prediction": "calibration",
-              "Chase list": "atrisk",
+              "Momentum risk": "atrisk",
               "Momentum trajectory": "trajectory",
               "Pass rate over time": "overtime",
               "Completion by month": "completion"}
     # Short labels for the on-screen view switcher (segmented button — must stay
     # compact so all fit the narrow docked pane).
-    _VIEW_LABELS = {"Calibration": "calibration", "Chase": "atrisk",
+    _VIEW_LABELS = {"Calibration": "calibration", "Risk": "atrisk",
                     "Trajectory": "trajectory", "Over time": "overtime",
                     "Completion": "completion"}
     # Completion-view month axis (label -> history.completion_by_month `by`).
@@ -69,7 +69,8 @@ class DataPanel:
         self._compl = None          # completion-by-month cache
         self.compl_by = "start"     # completion month axis
         self.compl_basis = "entry"  # Momentum reading for the predicted line
-        self._ar_show_dismissed = False   # chase list: reveal dismissed rows
+        self._ar_show_dismissed = False   # risk list: reveal dismissed rows
+        self._ar_window = None            # momentum window (weeks; None=all)
 
     # ---- mount / pop-out -------------------------------------------------
     def attach(self, tab) -> None:
@@ -821,28 +822,45 @@ class DataPanel:
     # §12/§15). Column key matches history.at_risk_students() fields; two display
     # columns ('contact_pref', 'replied') are formatted in _ar_fill.
     _AR_COLS = [
-        ("name", "Student", 140, "w"),
-        ("student_id", "ID", 78, "center"),
-        ("course_code", "Course", 54, "center"),
-        ("days_on_list", "On list", 52, "center"),
-        ("weeks_enrolled", "Wks in", 48, "center"),
-        ("days_since_contact", "No contact", 68, "center"),
-        ("term_days_left", "Term left", 58, "center"),
-        ("reachable", "Reach", 78, "center"),
-        ("suggested_channel", "Suggested", 74, "center"),
-        ("contact_pref", "Pref", 66, "center"),
-        ("ever_responded", "Replied?", 58, "center"),
-        ("chase_status", "State", 66, "center"),
+        ("name", "Student", 132, "w"),
+        ("student_id", "ID", 76, "center"),
+        ("course_code", "Course", 52, "center"),
+        ("risk", "Risk", 50, "center"),
+        ("avg_momentum_rank", "Avg MI", 54, "center"),
+        ("trend", "Trend", 48, "center"),
+        ("never_attempted", "Never att", 62, "center"),
+        ("days_since_contact", "No contact", 64, "center"),
+        ("term_days_left", "Term left", 56, "center"),
+        ("reachable", "Reach", 74, "center"),
+        ("suggested_channel", "Suggested", 72, "center"),
+        ("contact_pref", "Pref", 60, "center"),
+        ("ever_responded", "Replied?", 56, "center"),
+        ("chase_status", "State", 64, "center"),
     ]
+    # Momentum-trajectory window (label -> weeks; None = all history).
+    _AR_WINDOWS = {"All history": None, "8 weeks": 8, "6 weeks": 6,
+                   "4 weeks": 4}
 
     def _build_atrisk_controls(self, parent) -> None:
-        """Chase-list options: a 'Show dismissed' toggle (dismissed students are
-        hidden by default; on → they show greyed)."""
+        """Risk-list options: momentum-trajectory WINDOW selector + a 'Show
+        dismissed' toggle (dismissed students are hidden by default; on → greyed)."""
+        ctk.CTkLabel(parent, text="Window:").pack(side="left", padx=(6, 4))
+        cur = next((k for k, v in self._AR_WINDOWS.items()
+                    if v == self._ar_window), "All history")
+        wm = ctk.CTkOptionMenu(
+            parent, width=104, values=list(self._AR_WINDOWS),
+            command=self._ar_set_window)
+        wm.set(cur)
+        wm.pack(side="left", padx=(0, 10))
         self._ar_dismissed_var = tk.BooleanVar(value=self._ar_show_dismissed)
         ctk.CTkCheckBox(
             parent, text="Show dismissed", variable=self._ar_dismissed_var,
             checkbox_width=16, checkbox_height=16, font=ctk.CTkFont(size=11),
             command=self._ar_toggle_dismissed).pack(side="left", padx=(6, 0))
+
+    def _ar_set_window(self, label) -> None:
+        self._ar_window = self._AR_WINDOWS.get(label)
+        self._ar_refresh()
 
     def _ar_toggle_dismissed(self) -> None:
         self._ar_show_dismissed = bool(self._ar_dismissed_var.get())
@@ -864,10 +882,10 @@ class DataPanel:
             tree.heading(key, text=title,
                          command=lambda k=key: self._ar_sort_by(k))
             tree.column(key, width=w, anchor=anchor, stretch=(key == "name"))
-        # Row colour flags outreach difficulty: red = never replied on any
-        # channel (a cold contact), amber = has engaged at least once. Dismissed
-        # rows (only shown when the toggle is on) grey out regardless.
-        tree.tag_configure("cold", foreground="#e0524f")
+        # Row colour = risk tier (list is sorted by risk, so this shades the
+        # scan): red ≥20% modeled not-pass, amber ≥8%, plain below. Dismissed
+        # rows (shown only when the toggle is on) grey out regardless.
+        tree.tag_configure("hot", foreground="#e0524f")
         tree.tag_configure("warm", foreground="#d99a2b")
         tree.tag_configure("dismissed", foreground=("#7d7d7d" if dark else "#9a9a9a"))
         tree.grid(row=0, column=0, sticky="nsew")
@@ -883,7 +901,8 @@ class DataPanel:
         """(Re)load the worklist from the DB (syncing membership) and refill the
         table + status line. Used on first build, after a status change, and on
         the show-dismissed toggle."""
-        rows = history.chase_worklist(include_dismissed=self._ar_show_dismissed)
+        rows = history.chase_worklist(window_weeks=self._ar_window,
+                                      include_dismissed=self._ar_show_dismissed)
         self._ar_rows = rows
         # keep the active sort if one is set
         if self._ar_sort.get("col"):
@@ -891,19 +910,21 @@ class DataPanel:
         else:
             self._ar_fill(rows)
         active = [r for r in rows if r.get("chase_status") != "dismissed"]
-        cold = sum(1 for r in active if not r.get("ever_responded"))
+        hi = sum(1 for r in active if (r.get("risk") or 0) >= 0.20)
+        never = sum(1 for r in active if r.get("never_attempted"))
         contacted = sum(1 for r in active if r.get("chase_status") == "contacted")
-        extra = f", {contacted} marked contacted" if contacted else ""
+        extra = f", {contacted} contacted" if contacted else ""
+        win = next((k for k, v in self._AR_WINDOWS.items()
+                    if v == self._ar_window), "All history").lower()
         self.status.configure(text=(
-            f"{len(active)} students to chase ({cold} never replied{extra}). "
-            "Reachable, course underway, NEVER attempted a task (attempting ≈ "
-            "passing), and enrolled long enough to be a real stall — the group "
-            "that most needs a nudge. 'On list' = days since first surfaced. "
-            "'Suggested' is the channel to lead with (their preference, else text "
-            "if opted-in); 'Pref' shows it (* = manual override). Sorted by term "
-            "days left, then longest enrolled, then most neglected. Double-click "
-            "opens the student in the viewer; right-click for actions "
-            "(contacted / dismiss / copy ID)."))
+            f"{len(active)} in-progress students ranked by not-pass risk from "
+            f"their momentum trajectory ({win}); {hi} at ≥20%, {never} never "
+            f"attempted a task{extra}. 'Risk' = modeled not-pass probability "
+            "(a FLOOR — trust the ordering); 'Avg MI' = mean momentum rank "
+            "(1 Low–5 High); 'Trend' ↑ = recovering (deprioritise), ↓ = sliding. "
+            "'Never att' is a separate acute flag, not in the score. 'Suggested' "
+            "= channel to lead with (* = manual pref). Double-click opens the "
+            "student in the viewer; right-click for actions."))
 
     def _ar_fill(self, rows) -> None:
         t = self._ar_tree
@@ -912,24 +933,28 @@ class DataPanel:
         sv = lambda x: "" if x is None else str(x)
         for r in rows:
             st = r.get("chase_status") or ""
+            risk = r.get("risk") or 0
             tag = "dismissed" if st == "dismissed" else (
-                "warm" if r.get("ever_responded") else "cold")
+                "hot" if risk >= 0.20 else ("warm" if risk >= 0.08 else ""))
             pref = r.get("contact_pref") or ""
             if pref and r.get("contact_pref_source") == "manual":
                 pref += "*"
+            tr = r.get("trend") or 0
+            trend = "↑" if tr > 0.1 else ("↓" if tr < -0.1 else "→")
             state = {"contacted": "✓ contacted",
                      "dismissed": "dismissed"}.get(st, "")
             t.insert("", "end",
                      iid=f"{r['student_id']}|{r['course_code']}",
                      values=(r["name"], r["student_id"], r["course_code"],
-                             sv(r.get("days_on_list")),
-                             sv(r.get("weeks_enrolled")),
+                             f"{round(risk * 100)}%",
+                             f"{r.get('avg_momentum_rank', 0):.1f}", trend,
+                             "never" if r.get("never_attempted") else "",
                              sv(r.get("days_since_contact")),
                              sv(r["term_days_left"]), r.get("reachable", ""),
                              r.get("suggested_channel", ""), pref,
                              "yes" if r.get("ever_responded") else "never",
                              state),
-                     tags=(tag,))
+                     tags=(tag,) if tag else ())
 
     def _ar_sort_by(self, key, *, _toggle=True) -> None:
         st = self._ar_sort
@@ -1016,7 +1041,7 @@ class DataPanel:
                  "": "status cleared"}.get(status, status)
         try:
             self.app._append_log(
-                f"Chase list: {r['name'] or r['student_id']} — {label}.")
+                f"Risk list: {r['name'] or r['student_id']} — {label}.")
         except Exception:
             pass
         self._ar_refresh()
