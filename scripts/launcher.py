@@ -9403,6 +9403,34 @@ class App:
             return
         self._restore_main_sash()
 
+    def focus_caseload_student(self, student_id: str, name: str = "") -> None:
+        """Pull a student up in the caseload viewer by Student ID: make the
+        viewer visible, set its search box to the ID (a live filter → the grid
+        narrows to that student), and focus the first matching row so their
+        info + row actions are one keystroke away. Used by the Data → Chase list
+        (double-click / 'Open in viewer') to turn the worklist into something
+        you can act on. On-caseload students only; off-caseload go through
+        _open_student_global."""
+        panel = getattr(self, "caseload_panel", None)
+        if panel is None:
+            return
+        sid = (student_id or "").strip()
+        if not sid:
+            return
+        try:
+            if not getattr(self, "_caseload_visible", True):
+                self._toggle_caseload()
+            panel.search_var.set(sid)          # trace → _on_search → populate()
+            self.root.update_idletasks()
+            try:
+                panel._focus_first_row()
+            except Exception:
+                pass
+            who = name or sid
+            self._append_log(f"Chase list → showing {who} in the viewer.")
+        except Exception:
+            pass
+
     def _grow_window_width(self, delta: int) -> None:
         """Widen/narrow the main window by `delta` px, clamped on-screen.
         No-op when maximized."""

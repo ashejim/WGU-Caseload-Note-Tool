@@ -39,7 +39,7 @@ from typing import Optional
 from src import caseload_csv
 from src.config import HISTORY_DB
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 # Ordinal Momentum scale as it appears in the WGU export. Unknown / blank
 # values map to NULL rank (they still store the raw label).
@@ -219,6 +219,23 @@ CREATE TABLE IF NOT EXISTS student_flags (
     contact_pref TEXT,
     updated_at   TEXT
 );
+
+-- Persistent chase-list worklist. at_risk_students() recomputes membership
+-- live; this table remembers who's on it and SINCE WHEN (first_listed_at),
+-- when they last still qualified (last_listed_at), when they dropped off
+-- (resolved_at — attempted a task / outcome resolved), and the instructor's
+-- manual status. status: '' active / 'contacted' / 'dismissed'. Managed by
+-- sync_chase_list() + set_chase_status().
+CREATE TABLE IF NOT EXISTS chase_list (
+    student_id      TEXT NOT NULL,
+    course_code     TEXT NOT NULL,
+    first_listed_at TEXT,
+    last_listed_at  TEXT,
+    status          TEXT,
+    status_at       TEXT,
+    resolved_at     TEXT,
+    PRIMARY KEY (student_id, course_code)
+);
 """
 
 
@@ -229,8 +246,9 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     ).fetchone() is not None
     # Upgrade an EXISTING older schema first (so the DDL below, which indexes
     # the new 'bucket' column, doesn't run against a pre-bucket table). v2->v3
-    # only ADDS tables (meta, outcomes), which the IF NOT EXISTS DDL handles —
-    # no data migration needed, so only the v1->v2 rebuild is gated here.
+    # (meta, outcomes) and v3->v4 (student_flags, chase_list) only ADD tables,
+    # which the IF NOT EXISTS DDL handles — no data migration needed, so only
+    # the v1->v2 rebuild is gated here.
     if has_tables and v < 2:
         _migrate_v1_to_v2(conn)
     conn.executescript(_SCHEMA_DDL)  # create from scratch / fill in any gaps
@@ -1499,6 +1517,118 @@ def at_risk_students(*, db_path=HISTORY_DB, now: Optional[datetime] = None,
         a["term_days_left"] if a["term_days_left"] is not None else 1 << 30,
         -(a["weeks_enrolled"] or 0), -(a["days_since_contact"] or 0)))
     return out
+
+
+# ----------------------------------------------------------------------
+# chase-list worklist (persistent membership + instructor status)
+# ----------------------------------------------------------------------
+# at_risk_students() recomputes the chase list live on every call. The worklist
+# layer persists it: who is on it and SINCE WHEN (first_listed_at), when they
+# last still qualified (last_listed_at), when they dropped off (resolved_at —
+# they attempted a task or the outcome resolved), and the instructor's manual
+# status (contacted / dismissed). That turns a volatile view into a durable
+# list you can work down over days.
+_CHASE_STATUSES = {"contacted", "dismissed"}
+
+
+def sync_chase_list(*, db_path=HISTORY_DB,
+                    now: Optional[datetime] = None) -> list[dict]:
+    """Recompute the live chase list and reconcile it against the persistent
+    ``chase_list`` ledger, then return the live rows enriched with the persisted
+    fields (``first_listed_at``, ``days_on_list``, ``chase_status``,
+    ``status_at``).
+
+    Reconciliation in one pass:
+      * a student newly on the list is INSERTed (first_listed_at = now);
+      * one still on the list has last_listed_at bumped and any resolved_at
+        cleared (they are back / still here) — first_listed_at and the manual
+        status are preserved (a dismissed student STAYS dismissed until you
+        clear it);
+      * one previously listed but no longer qualifying gets resolved_at = now
+        (they left the worklist — attempted a task or the outcome resolved).
+    """
+    ts = now or datetime.now()
+    ts_iso = ts.isoformat(timespec="seconds")
+    live = at_risk_students(db_path=db_path, now=ts)
+    live_keys = {(r["student_id"], r["course_code"]) for r in live}
+
+    conn = _connect(db_path)
+    try:
+        existing = {(r["student_id"], r["course_code"]): r for r in
+                    conn.execute("SELECT * FROM chase_list").fetchall()}
+        with conn:
+            for r in live:
+                key = (r["student_id"], r["course_code"])
+                if key in existing:
+                    conn.execute(
+                        "UPDATE chase_list SET last_listed_at = ?, "
+                        "resolved_at = NULL WHERE student_id = ? AND "
+                        "course_code = ?", (ts_iso, key[0], key[1]))
+                else:
+                    conn.execute(
+                        "INSERT INTO chase_list (student_id, course_code, "
+                        "first_listed_at, last_listed_at, status, status_at, "
+                        "resolved_at) VALUES (?, ?, ?, ?, '', NULL, NULL)",
+                        (key[0], key[1], ts_iso, ts_iso))
+            for key, row in existing.items():
+                if key not in live_keys and row["resolved_at"] is None:
+                    conn.execute(
+                        "UPDATE chase_list SET resolved_at = ? WHERE "
+                        "student_id = ? AND course_code = ?",
+                        (ts_iso, key[0], key[1]))
+        persisted = {(r["student_id"], r["course_code"]): r for r in
+                     conn.execute("SELECT * FROM chase_list").fetchall()}
+    finally:
+        conn.close()
+
+    today = ts.date()
+    for r in live:
+        p = persisted.get((r["student_id"], r["course_code"]))
+        first = (p["first_listed_at"] if p else None) or ts_iso
+        try:
+            days_on = (today - datetime.fromisoformat(first).date()).days
+        except Exception:
+            days_on = 0
+        r["first_listed_at"] = first
+        r["days_on_list"] = days_on
+        r["chase_status"] = (p["status"] or "") if p else ""
+        r["status_at"] = (p["status_at"] or "") if p else ""
+    return live
+
+
+def set_chase_status(student_id: str, course_code: str, status: str, *,
+                     db_path=HISTORY_DB, now: Optional[datetime] = None):
+    """Set the instructor's manual status on a chase-list row. ``status`` in
+    {'contacted','dismissed'}; '' clears it (back to active). Upserts so it
+    works even if a sync has not recorded the row yet."""
+    status = (status or "").strip().lower()
+    if status and status not in _CHASE_STATUSES:
+        raise ValueError(f"status must be one of {_CHASE_STATUSES} or ''")
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
+    conn = _connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO chase_list (student_id, course_code, "
+                "first_listed_at, last_listed_at, status, status_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(student_id, course_code) "
+                "DO UPDATE SET status = excluded.status, "
+                "status_at = excluded.status_at",
+                (student_id, course_code, ts, ts, status, ts))
+    finally:
+        conn.close()
+
+
+def chase_worklist(*, db_path=HISTORY_DB, now: Optional[datetime] = None,
+                   include_dismissed: bool = False) -> list[dict]:
+    """The chase list as a persistent worklist: syncs membership then returns
+    the enriched live rows, hiding dismissed students unless
+    ``include_dismissed``. Dismissed rows keep chase_status='dismissed' so the
+    caller can grey them."""
+    rows = sync_chase_list(db_path=db_path, now=now)
+    if not include_dismissed:
+        rows = [r for r in rows if r.get("chase_status") != "dismissed"]
+    return rows
 
 
 # ----------------------------------------------------------------------

@@ -69,6 +69,7 @@ class DataPanel:
         self._compl = None          # completion-by-month cache
         self.compl_by = "start"     # completion month axis
         self.compl_basis = "entry"  # Momentum reading for the predicted line
+        self._ar_show_dismissed = False   # chase list: reveal dismissed rows
 
     # ---- mount / pop-out -------------------------------------------------
     def attach(self, tab) -> None:
@@ -125,6 +126,7 @@ class DataPanel:
                           **SECONDARY_BTN_KWARGS).pack(side="right")
         v = self.view
         if v == "atrisk":
+            self._build_atrisk_controls(self.ctrls)
             self._view_atrisk(self.content)
         elif v == "trajectory":
             self._build_trajectory_controls(self.ctrls)
@@ -822,6 +824,7 @@ class DataPanel:
         ("name", "Student", 140, "w"),
         ("student_id", "ID", 78, "center"),
         ("course_code", "Course", 54, "center"),
+        ("days_on_list", "On list", 52, "center"),
         ("weeks_enrolled", "Wks in", 48, "center"),
         ("days_since_contact", "No contact", 68, "center"),
         ("term_days_left", "Term left", 58, "center"),
@@ -829,11 +832,23 @@ class DataPanel:
         ("suggested_channel", "Suggested", 74, "center"),
         ("contact_pref", "Pref", 66, "center"),
         ("ever_responded", "Replied?", 58, "center"),
+        ("chase_status", "State", 66, "center"),
     ]
 
+    def _build_atrisk_controls(self, parent) -> None:
+        """Chase-list options: a 'Show dismissed' toggle (dismissed students are
+        hidden by default; on → they show greyed)."""
+        self._ar_dismissed_var = tk.BooleanVar(value=self._ar_show_dismissed)
+        ctk.CTkCheckBox(
+            parent, text="Show dismissed", variable=self._ar_dismissed_var,
+            checkbox_width=16, checkbox_height=16, font=ctk.CTkFont(size=11),
+            command=self._ar_toggle_dismissed).pack(side="left", padx=(6, 0))
+
+    def _ar_toggle_dismissed(self) -> None:
+        self._ar_show_dismissed = bool(self._ar_dismissed_var.get())
+        self._ar_refresh()
+
     def _view_atrisk(self, parent) -> None:
-        rows = history.at_risk_students()
-        self._ar_rows = rows
         self._ar_sort = {"col": None, "rev": False}
         dark = ctk.get_appearance_mode() == "Dark"
         style = ttk.Style()
@@ -850,24 +865,45 @@ class DataPanel:
                          command=lambda k=key: self._ar_sort_by(k))
             tree.column(key, width=w, anchor=anchor, stretch=(key == "name"))
         # Row colour flags outreach difficulty: red = never replied on any
-        # channel (a cold contact), amber = has engaged at least once.
+        # channel (a cold contact), amber = has engaged at least once. Dismissed
+        # rows (only shown when the toggle is on) grey out regardless.
         tree.tag_configure("cold", foreground="#e0524f")
         tree.tag_configure("warm", foreground="#d99a2b")
+        tree.tag_configure("dismissed", foreground=("#7d7d7d" if dark else "#9a9a9a"))
         tree.grid(row=0, column=0, sticky="nsew")
         sb = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
         sb.grid(row=0, column=1, sticky="ns")
         tree.configure(yscrollcommand=sb.set)
         tree.bind("<Double-1>", self._ar_open)
-        self._ar_fill(rows)
-        cold = sum(1 for r in rows if not r.get("ever_responded"))
+        # Right-click a row → mark contacted / dismiss (snooze) / clear status.
+        tree.bind("<Button-3>", self._ar_context_menu)
+        self._ar_refresh()
+
+    def _ar_refresh(self) -> None:
+        """(Re)load the worklist from the DB (syncing membership) and refill the
+        table + status line. Used on first build, after a status change, and on
+        the show-dismissed toggle."""
+        rows = history.chase_worklist(include_dismissed=self._ar_show_dismissed)
+        self._ar_rows = rows
+        # keep the active sort if one is set
+        if self._ar_sort.get("col"):
+            self._ar_sort_by(self._ar_sort["col"], _toggle=False)
+        else:
+            self._ar_fill(rows)
+        active = [r for r in rows if r.get("chase_status") != "dismissed"]
+        cold = sum(1 for r in active if not r.get("ever_responded"))
+        contacted = sum(1 for r in active if r.get("chase_status") == "contacted")
+        extra = f", {contacted} marked contacted" if contacted else ""
         self.status.configure(text=(
-            f"{len(rows)} students to chase ({cold} never replied). Reachable, "
-            "course underway, NEVER attempted a task (attempting ≈ passing), and "
-            "enrolled long enough to be a real stall — the group that most needs a "
-            "nudge. 'Suggested' is the channel to lead with (their preference, "
-            "else text if opted-in); 'Pref' shows it (* = manual override, else "
-            "auto-inferred from replies). Sorted by term days left, then longest "
-            "enrolled, then most neglected. Double-click a row to copy the ID."))
+            f"{len(active)} students to chase ({cold} never replied{extra}). "
+            "Reachable, course underway, NEVER attempted a task (attempting ≈ "
+            "passing), and enrolled long enough to be a real stall — the group "
+            "that most needs a nudge. 'On list' = days since first surfaced. "
+            "'Suggested' is the channel to lead with (their preference, else text "
+            "if opted-in); 'Pref' shows it (* = manual override). Sorted by term "
+            "days left, then longest enrolled, then most neglected. Double-click "
+            "opens the student in the viewer; right-click for actions "
+            "(contacted / dismiss / copy ID)."))
 
     def _ar_fill(self, rows) -> None:
         t = self._ar_tree
@@ -875,24 +911,31 @@ class DataPanel:
             t.delete(i)
         sv = lambda x: "" if x is None else str(x)
         for r in rows:
-            tag = "warm" if r.get("ever_responded") else "cold"
+            st = r.get("chase_status") or ""
+            tag = "dismissed" if st == "dismissed" else (
+                "warm" if r.get("ever_responded") else "cold")
             pref = r.get("contact_pref") or ""
             if pref and r.get("contact_pref_source") == "manual":
                 pref += "*"
+            state = {"contacted": "✓ contacted",
+                     "dismissed": "dismissed"}.get(st, "")
             t.insert("", "end",
                      iid=f"{r['student_id']}|{r['course_code']}",
                      values=(r["name"], r["student_id"], r["course_code"],
+                             sv(r.get("days_on_list")),
                              sv(r.get("weeks_enrolled")),
                              sv(r.get("days_since_contact")),
                              sv(r["term_days_left"]), r.get("reachable", ""),
                              r.get("suggested_channel", ""), pref,
-                             "yes" if r.get("ever_responded") else "never"),
+                             "yes" if r.get("ever_responded") else "never",
+                             state),
                      tags=(tag,))
 
-    def _ar_sort_by(self, key) -> None:
+    def _ar_sort_by(self, key, *, _toggle=True) -> None:
         st = self._ar_sort
-        st["rev"] = (not st["rev"]) if st["col"] == key else False
-        st["col"] = key
+        if _toggle:
+            st["rev"] = (not st["rev"]) if st["col"] == key else False
+            st["col"] = key
         field = key
 
         def sort_key(r):
@@ -906,15 +949,74 @@ class DataPanel:
         self._ar_fill(self._ar_rows)
 
     def _ar_open(self, _event=None) -> None:
-        """Double-click: copy the Student ID (handy to paste into the viewer
-        search or the browser global search)."""
+        """Double-click: pull the student up in the caseload viewer (filtered to
+        them), so their info + row actions are right there."""
+        r = self._ar_focused_row()
+        if r is not None:
+            self._ar_show_in_viewer(r)
+
+    def _ar_focused_row(self):
         sel = self._ar_tree.focus()
         if not sel:
-            return
-        sid = sel.split("|", 1)[0]
+            return None
+        return next((x for x in self._ar_rows
+                     if f"{x['student_id']}|{x['course_code']}" == sel), None)
+
+    def _ar_show_in_viewer(self, r) -> None:
+        try:
+            self.app.focus_caseload_student(r["student_id"], r.get("name") or "")
+        except Exception:
+            pass
+
+    def _ar_copy_id(self, r) -> None:
+        sid = r["student_id"]
         try:
             self.app.root.clipboard_clear()
             self.app.root.clipboard_append(sid)
             self.app._append_log(f"Copied Student ID: {sid}")
         except Exception:
             pass
+
+    def _ar_context_menu(self, event) -> None:
+        """Right-click a chase-list row → mark contacted / dismiss / clear."""
+        row = self._ar_tree.identify_row(event.y)
+        if not row:
+            return
+        self._ar_tree.selection_set(row)
+        self._ar_tree.focus(row)
+        r = next((x for x in self._ar_rows
+                  if f"{x['student_id']}|{x['course_code']}" == row), None)
+        if r is None:
+            return
+        cur = r.get("chase_status") or ""
+        m = tk.Menu(self._ar_tree, tearoff=0)
+        m.add_command(label="👤 Open in viewer",
+                      command=lambda: self._ar_show_in_viewer(r))
+        m.add_command(label="⧉ Copy Student ID",
+                      command=lambda: self._ar_copy_id(r))
+        m.add_separator()
+        m.add_command(
+            label=("✓ Contacted (set)" if cur != "contacted"
+                   else "✓ Contacted ✓"),
+            command=lambda: self._ar_set_status(r, "contacted"))
+        m.add_command(label="🔕 Dismiss (snooze)",
+                      command=lambda: self._ar_set_status(r, "dismissed"))
+        if cur:
+            m.add_separator()
+            m.add_command(label="↩ Clear status",
+                          command=lambda: self._ar_set_status(r, ""))
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+
+    def _ar_set_status(self, r, status) -> None:
+        history.set_chase_status(r["student_id"], r["course_code"], status)
+        label = {"contacted": "marked contacted", "dismissed": "dismissed",
+                 "": "status cleared"}.get(status, status)
+        try:
+            self.app._append_log(
+                f"Chase list: {r['name'] or r['student_id']} — {label}.")
+        except Exception:
+            pass
+        self._ar_refresh()
