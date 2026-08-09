@@ -278,6 +278,10 @@ TASK_BADGE_STYLES: dict = {
     "pending":   ("⧖", ("#1f6feb", "#2f81f7"), "#ffffff"),
     "submitted": ("•", ("gray70", "gray45"), "#ffffff"),
     "none":      ("–", ("gray80", "gray35"), ("gray30", "gray75")),
+    # Off-caseload students: their live pass/fail isn't reachable (the fetch
+    # row-filters OUR caseload list), so the badge shows an unknown mark but
+    # still opens the authoritative EMA Score Report.
+    "unknown":   ("?", ("gray75", "gray40"), ("gray20", "gray85")),
 }
 
 # Map the live list view's task-cell color class → badge state.
@@ -5406,6 +5410,37 @@ class CaseloadPanel:
         name = self._cell(row, "Name") or student_id
         self.app._open_task_report(student_id, course_code, task_num, name)
 
+    def _qv_offcaseload_task_badges(self, r, course, sid, name) -> int:
+        """Clickable EMA Score-Report badges for an off-caseload student's
+        course that WE support (it's on our caseload). Their live pass/fail
+        isn't reachable (the status fetch row-filters our own caseload list, and
+        they're not on it), so the badges show an 'unknown' mark — but they open
+        the authoritative Score Report all the same, which is exactly what's
+        needed when the caseload lags a real submission/pass."""
+        bar = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+        bar.grid(row=r, column=0, columnspan=2, sticky="w", pady=(4, 1))
+        ctk.CTkLabel(
+            bar, text=f"Tasks ({course}):",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray35", "gray70"),
+        ).pack(side="left", padx=(0, 6))
+        mark, bg, fg = TASK_BADGE_STYLES["unknown"]
+        for i in (1, 2, 3):
+            badge = ctk.CTkLabel(
+                bar, text=f"T{i} {mark}", corner_radius=6,
+                font=ctk.CTkFont(size=11, weight="bold"), width=42, height=20,
+                fg_color=bg, text_color=fg)
+            badge.pack(side="left", padx=2)
+            badge.configure(cursor="hand2")
+            badge.bind(
+                "<Button-1>",
+                lambda e, t=i, c=course: self.app._open_task_report(
+                    sid, c, t, name))
+            _attach_tooltip(
+                badge, f"Task {i} ({course}): status unknown (off-caseload)\n"
+                "click to open the EMA Score Report")
+        return r + 1
+
     def _copy_text(self, text: str) -> None:
         try:
             self.frame.clipboard_clear()
@@ -6978,6 +7013,22 @@ class CaseloadPanel:
         r = line(r, "PM email", profile.get("mentor_email", ""), copy=True)
         # ACI — the assigned course instructor(s), prominent.
         r = self._oc_aci_block(r, active, enriched)
+        # If this student shares a course WE support (it's on our caseload),
+        # offer clickable EMA task badges for it — their pass/fail isn't
+        # reachable, but the Score Report is (see _qv_offcaseload_task_badges).
+        oc_sid = str(profile.get("student_id", "") or "").strip()
+        if enriched and oc_sid:
+            supported = {
+                str(row.get("CourseCode", "")
+                    or row.get("Course Code", "")).strip()
+                for row in (self.app._caseload_rows or [])}
+            supported.discard("")
+            shown_courses = set()
+            for a in active:
+                c = str(a.get("course", "") or "").strip()
+                if c and c in supported and c not in shown_courses:
+                    shown_courses.add(c)
+                    r = self._qv_offcaseload_task_badges(r, c, oc_sid, name)
         r = line(r, "Program", profile.get("program", "")
                  or profile.get("degree_program", ""))
         r = line(r, "Term #", profile.get("term_number", ""))

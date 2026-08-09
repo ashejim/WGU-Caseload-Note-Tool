@@ -14,7 +14,7 @@ from src import caseload_csv  # noqa: E402
 from src import caseload_filter as cf  # noqa: E402
 
 _NEW = {
-    "Risk": "MomentumRisk",
+    "Risk %": "MomentumRisk",
     "Avg Momentum Rank": "AvgMomentumRank",
     "Momentum Trend": "MomentumTrend",
     "Never Attempted": "NeverAttempted",
@@ -53,15 +53,15 @@ def test_columns_registered_and_roundtrip():
 def test_risk_range_and_pref():
     # the motivating example: 20 <= risk <= 30 AND preference is text
     got = _match([
-        {"column": "Risk", "op": "at least", "value": "20"},
-        {"column": "Risk", "op": "at most", "value": "30"},
+        {"column": "Risk %", "op": "at least", "value": "20"},
+        {"column": "Risk %", "op": "at most", "value": "30"},
         {"column": "Contact Preference", "op": "is", "value": "text"},
     ])
     assert got == {"B"}, got            # A too high, C email, D too low, E blank
 
 
 def test_blank_risk_excluded_by_numeric():
-    got = _match([{"column": "Risk", "op": "at least", "value": "1"}])
+    got = _match([{"column": "Risk %", "op": "at least", "value": "1"}])
     assert "E" not in got and got == {"A", "B", "C", "D"}, got
 
 

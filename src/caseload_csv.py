@@ -73,7 +73,7 @@ DISPLAY_TO_CSV: dict[str, str] = {
     # momentum_risk_students). Populated only for in-progress, scored students;
     # blank otherwise. Filter to target outreach — e.g. Momentum Risk 'at least
     # 20' + 'at most 30' with Contact Preference 'is text'.
-    "Risk": "MomentumRisk",                        # not-pass probability, 0–100
+    "Risk %": "MomentumRisk",                      # not-pass probability, 0–100
     "Avg Momentum Rank": "AvgMomentumRank",        # mean momentum, 1 Low–5 High
     "Momentum Trend": "MomentumTrend",             # >0 recovering, <0 sliding
     "Never Attempted": "NeverAttempted",           # Yes / No
