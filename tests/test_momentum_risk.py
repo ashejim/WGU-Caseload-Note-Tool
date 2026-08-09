@@ -94,6 +94,20 @@ def test_calibration_low_riskier_than_high():
 
 # ---- ranking of live students -------------------------------------------
 
+def test_interp_risk_continuous_and_monotonic():
+    rates = [0.32, 0.16, 0.16, 0.03, 0.005]
+    # clamp past the end anchors
+    assert history._interp_risk(1.0, rates) == 0.32
+    assert history._interp_risk(5.0, rates) == 0.005
+    # a mid avg-rank lands STRICTLY between bucket rates (fills the gap)
+    mid = history._interp_risk(1.5, rates)
+    assert 0.16 < mid < 0.32, mid
+    # non-increasing across the whole range
+    ys = [history._interp_risk(x, rates)
+          for x in (1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0)]
+    assert all(ys[i] >= ys[i + 1] - 1e-9 for i in range(len(ys) - 1)), ys
+
+
 def test_ranks_by_risk_and_excludes_resolved():
     def seed(c):
         # calibration set

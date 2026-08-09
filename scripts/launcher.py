@@ -5984,6 +5984,10 @@ class CaseloadPanel:
     @staticmethod
     def _sortkey(v):
         s = str(v).strip()
+        if not s:
+            # Blank sorts as the LOWEST number so a numeric column reads
+            # high→low→blank descending (blanks last), not blank→high→low.
+            return (0, float("-inf"))
         try:
             return (0, float(s.replace(",", "")))
         except ValueError:
@@ -15723,7 +15727,13 @@ class App:
           LastActionType        — action name of the latest note we logged
           DaysSinceLastAction   — today − that note's date
           TaskStalledDays       — days the task status has been unchanged
-        Blank ('') where the source date/value is missing."""
+          MomentumRisk          — modeled not-pass probability (0–100)
+          AvgMomentumRank       — mean momentum rank (1 Low–5 High)
+          MomentumTrend         — momentum trend (>0 recovering, <0 sliding)
+          NeverAttempted        — 'Yes'/'No'
+          ContactPref           — preferred channel (text/email/call)
+        Blank ('') where the source date/value is missing (the momentum columns
+        are blank for resolved / not-yet-underway / unscored students)."""
         rows = self._caseload_rows or []
         if not rows:
             return
@@ -15732,6 +15742,18 @@ class App:
             stall = history.task_stall_days()
         except Exception:
             stall = {}
+        # Momentum-risk signals, keyed by (student, course). Computed once over
+        # all history (the stable window); joined onto rows below so viewer
+        # filters / fired actions can target by risk + contact preference. The
+        # student id is normalised (strip leading zeros) so a grid-JSON row and a
+        # snapshot key match regardless of zero-padding.
+        def _nsid(s):
+            return str(s or "").strip().lstrip("0")
+        try:
+            risk_map = {(_nsid(x["student_id"]), str(x["course_code"]).strip()): x
+                        for x in history.momentum_risk_students()}
+        except Exception:
+            risk_map = {}
 
         def _num(v):
             return "" if v is None else v
@@ -15760,6 +15782,20 @@ class App:
                 r["LastActionType"] = ""
                 r["DaysSinceLastAction"] = ""
             r["TaskStalledDays"] = _num(stall.get((sid, course)))
+            # Momentum-risk signals (blank for unscored students).
+            mr = risk_map.get((sid.lstrip("0"), course))
+            if mr:
+                r["MomentumRisk"] = round((mr.get("risk") or 0) * 100, 1)
+                r["AvgMomentumRank"] = mr.get("avg_momentum_rank", "")
+                r["MomentumTrend"] = mr.get("trend", "")
+                r["NeverAttempted"] = "Yes" if mr.get("never_attempted") else "No"
+                r["ContactPref"] = mr.get("contact_pref", "") or ""
+            else:
+                r["MomentumRisk"] = ""
+                r["AvgMomentumRank"] = ""
+                r["MomentumTrend"] = ""
+                r["NeverAttempted"] = ""
+                r["ContactPref"] = ""
             # PM email captured from a prior fire/email for this student — used
             # by the panel email-click CC (real address vs the name fallback).
             pm = pm_by_sid.get(sid)

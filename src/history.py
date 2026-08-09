@@ -1656,6 +1656,11 @@ def _actionable_fields(r, e, *, db_path=HISTORY_DB, led=None) -> dict:
 # tautological, so baking it into the score would distort it).
 _RISK_BUCKETS = [(1.5, "1.0–1.5"), (2.5, "1.5–2.5"), (3.5, "2.5–3.5"),
                  (4.5, "3.5–4.5"), (99.0, "4.5–5.0")]
+# Representative avg-rank at each bucket's centre — the anchor points the
+# continuous risk curve is interpolated between (so risk varies smoothly with
+# avg momentum rank instead of snapping to 4–5 discrete bucket rates, which left
+# gaps that made band filters like "20–30%" match nobody).
+_RISK_BUCKET_CENTERS = (1.25, 2.0, 3.0, 4.0, 4.75)
 
 
 def _avg_rank_bucket_idx(avg: float) -> int:
@@ -1663,6 +1668,24 @@ def _avg_rank_bucket_idx(avg: float) -> int:
         if avg < hi:
             return i
     return len(_RISK_BUCKETS) - 1
+
+
+def _interp_risk(avg: float, rates: list) -> float:
+    """Continuous not-pass risk for a student's average momentum rank: piecewise-
+    linear interpolation between the per-bucket calibrated ``rates`` anchored at
+    _RISK_BUCKET_CENTERS, clamped past the end anchors. Gives a smooth spread
+    (so risk bands are populated) while staying pinned to the calibrated rates."""
+    centers = _RISK_BUCKET_CENTERS
+    if avg <= centers[0]:
+        return rates[0]
+    if avg >= centers[-1]:
+        return rates[-1]
+    for i in range(len(centers) - 1):
+        a, b = centers[i], centers[i + 1]
+        if a <= avg <= b:
+            f = (avg - a) / (b - a) if b > a else 0.0
+            return rates[i] + f * (rates[i + 1] - rates[i])
+    return rates[-1]
 
 
 def _isotonic_noninc(counts: list[tuple]) -> list[float]:
@@ -1786,7 +1809,7 @@ def momentum_risk_students(*, window_weeks: Optional[int] = None,
         if not h:
             continue                              # no momentum reading to score
         avg = sum(h) / len(h)
-        risk = calib["prob"][_avg_rank_bucket_idx(avg)]
+        risk = _interp_risk(avg, calib["prob"])
         half = len(h) // 2 or 1
         trend = (sum(h[half:]) / max(1, len(h) - half)) - (sum(h[:half]) / half)
         row = _actionable_fields(r, e, db_path=db_path)

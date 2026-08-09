@@ -68,6 +68,16 @@ DISPLAY_TO_CSV: dict[str, str] = {
     # (e.g. "is within this month") to catch students actually finishing soon —
     # an IC overrides a later term end, which a raw Term End filter would miss.
     "Effective End Date": "EffectiveEndDate",
+    # Momentum-risk signal columns computed from history.db's momentum
+    # trajectory (App._apply_derived_columns_to_rows → history.
+    # momentum_risk_students). Populated only for in-progress, scored students;
+    # blank otherwise. Filter to target outreach — e.g. Momentum Risk 'at least
+    # 20' + 'at most 30' with Contact Preference 'is text'.
+    "Risk": "MomentumRisk",                        # not-pass probability, 0–100
+    "Avg Momentum Rank": "AvgMomentumRank",        # mean momentum, 1 Low–5 High
+    "Momentum Trend": "MomentumTrend",             # >0 recovering, <0 sliding
+    "Never Attempted": "NeverAttempted",           # Yes / No
+    "Contact Preference": "ContactPref",           # text / email / call
 }
 
 
