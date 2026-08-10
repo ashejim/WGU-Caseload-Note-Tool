@@ -36,6 +36,11 @@ class QueuePanel:
         self._pause_btn = None
         self._cancel_btn = None
         self._clear_done_btn = None
+        self.pl_bar = None
+        self.playlist_var = None
+        self._playlist_menu = None
+        self._load_btn = None
+        self._manage_btn = None
 
     # ---- mount -----------------------------------------------------------
     def attach(self, tab) -> None:
@@ -46,11 +51,36 @@ class QueuePanel:
         for w in parent.winfo_children():
             w.destroy()
         parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(1, weight=1)
+        parent.grid_rowconfigure(2, weight=1)
+
+        # Playlist bar: pick a saved playlist and load its actions into the
+        # queue in one step, or open the manager to create/edit playlists.
+        self.pl_bar = ctk.CTkFrame(parent, fg_color="transparent")
+        self.pl_bar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 0))
+        ctk.CTkLabel(self.pl_bar, text="🎵 Playlist:").pack(side="left")
+        self.playlist_var = ctk.StringVar(value="")
+        self._playlist_menu = ctk.CTkOptionMenu(
+            self.pl_bar, variable=self.playlist_var, values=["(none)"],
+            width=220)
+        self._playlist_menu.pack(side="left", padx=(6, 0))
+        self._load_btn = ctk.CTkButton(
+            self.pl_bar, text="▶ Load", width=76, command=self._on_load_playlist)
+        self._load_btn.pack(side="left", padx=(8, 0))
+        try:
+            _attach_tooltip(
+                self._load_btn,
+                "Review + add this playlist's actions to the queue. They land "
+                "as checked rows — press ▶ Start to run them.")
+        except Exception:
+            pass
+        self._manage_btn = ctk.CTkButton(
+            self.pl_bar, text="⚙ Manage playlists", width=150,
+            command=self._on_manage_playlists, **SECONDARY_BTN_KWARGS)
+        self._manage_btn.pack(side="right")
 
         # Control bar: Add-to-queue toggle | Start | Pause | Cancel.
         self.ctrls = ctk.CTkFrame(parent, fg_color="transparent")
-        self.ctrls.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+        self.ctrls.grid(row=1, column=0, sticky="ew", padx=6, pady=(4, 2))
         self._add_btn = ctk.CTkButton(
             self.ctrls, text="➕ Add to queue", width=130,
             command=self._toggle_add_mode,
@@ -82,8 +112,9 @@ class QueuePanel:
 
         # Scrollable row list.
         self.listbox = ctk.CTkScrollableFrame(parent, fg_color="transparent")
-        self.listbox.grid(row=1, column=0, sticky="nsew", padx=6, pady=(2, 6))
+        self.listbox.grid(row=2, column=0, sticky="nsew", padx=6, pady=(2, 6))
         self.listbox.grid_columnconfigure(0, weight=1)
+        self.refresh_playlists()
         self.refresh()
 
     # ---- render ----------------------------------------------------------
@@ -196,6 +227,14 @@ class QueuePanel:
             self._clear_done_btn.configure(
                 state="normal" if (self.app.action_queue.has_done()
                                    and not running) else "disabled")
+        # playlist Load: needs a real playlist selected and an idle queue (a
+        # load reviews + adds actions, which can't happen mid-run or mid-task).
+        if self._load_btn is not None:
+            has_pl = bool(getattr(self.app, "playlists", None))
+            busy = getattr(self.app, "_is_busy", False)
+            self._load_btn.configure(
+                state="normal" if (has_pl and not running and not busy)
+                else "disabled")
 
     def on_run_state_changed(self) -> None:
         """Reflect the run state on Pause/Cancel (and, via _sync_controls,
@@ -217,6 +256,32 @@ class QueuePanel:
             self._cancel_btn.configure(
                 state="normal" if running else "disabled")
         self._sync_controls()
+
+    # ---- playlists -------------------------------------------------------
+    def refresh_playlists(self) -> None:
+        """Repopulate the playlist dropdown from app.playlists. Call after the
+        manager saves (via App) and once at mount."""
+        if self._playlist_menu is None:
+            return
+        names = [p.name for p in getattr(self.app, "playlists", None) or []]
+        if names:
+            self._playlist_menu.configure(values=names, state="normal")
+            if self.playlist_var.get() not in names:
+                self.playlist_var.set(names[0])
+        else:
+            self._playlist_menu.configure(values=["(no playlists)"],
+                                          state="disabled")
+            self.playlist_var.set("(no playlists)")
+        self._sync_controls()
+
+    def _on_load_playlist(self) -> None:
+        name = self.playlist_var.get()
+        if not name or not (getattr(self.app, "playlists", None) or []):
+            return
+        self.app._queue_load_playlist(name)
+
+    def _on_manage_playlists(self) -> None:
+        self.app._open_playlist_manager()
 
     # ---- interactions ---------------------------------------------------
     def _toggle_check(self, action_name: str, var) -> None:

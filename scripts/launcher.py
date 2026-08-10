@@ -121,11 +121,11 @@ from src.colors import (
 )
 from src.scenarios import (
     SCENARIOS_YAML, BatchConfig, EmailConfig, Group, PathField, PathStep,
-    ScenarioConfig, SuccessPath, NoteTemplate, NoteTemplateField,
+    ScenarioConfig, SuccessPath, NoteTemplate, NoteTemplateField, Playlist,
     NOTE_FIELD_KINDS, load_groups, load_scenarios, load_note_templates,
-    load_success_paths, note_template_to_dict, parse_note_template_text,
-    render_note_template, run_scenario, success_path_to_dict, _note_from_dict,
-    _branch_to_dict,
+    load_playlists, load_success_paths, note_template_to_dict, playlist_to_dict,
+    parse_note_template_text, render_note_template, run_scenario,
+    success_path_to_dict, _note_from_dict, _branch_to_dict,
 )
 from src.action_panel import ActionPanel
 from src.walkthrough import Walkthrough
@@ -8050,6 +8050,9 @@ class App:
         # Reusable structured note bodies (see NoteTemplate). Chosen + filled at
         # fire time; empty until the user defines one.
         self.note_templates: list[NoteTemplate] = load_note_templates()
+        # Saved queue playlists (ordered sets of batch actions loaded into the
+        # queue in one step — see Playlist). Empty until the user defines one.
+        self.playlists: list[Playlist] = load_playlists()
         # Preferences were loaded above (before the data-unlock step). Share
         # the name-casing pref with the template builders.
         self._sync_name_cap_mode()
@@ -10682,6 +10685,7 @@ class App:
             self.groups = load_groups()
             self.success_paths = load_success_paths()
             self.note_templates = load_note_templates()
+            self.playlists = load_playlists()
             self._refresh_scenario_raw()
         except Exception as e:
             self._append_log(f"Loaded but reload failed: {e}", error=True)
@@ -10808,6 +10812,7 @@ class App:
             self.groups = load_groups()
             self.success_paths = load_success_paths()
             self.note_templates = load_note_templates()
+            self.playlists = load_playlists()
             self._refresh_scenario_raw()
         except Exception as e:
             self._append_log(f"Revert failed: {e}")
@@ -11006,6 +11011,15 @@ class App:
                 note_template_to_dict(t) for t in self.note_templates
             ]
 
+        # Persist queue playlists (see Playlist). Same rebuild-from-scratch rule
+        # as note_templates — re-emit from the in-memory list or an action edit
+        # would drop every playlist. Dangling action refs are kept (harmless;
+        # skipped-with-notice at load, and the action may be re-added later).
+        if getattr(self, "playlists", None):
+            new_doc["playlists"] = [
+                playlist_to_dict(p) for p in self.playlists
+            ]
+
         try:
             SCENARIOS_YAML.write_text(
                 yaml.safe_dump(new_doc, sort_keys=False, allow_unicode=True),
@@ -11019,6 +11033,7 @@ class App:
             self.groups = load_groups()
             self.success_paths = load_success_paths()
             self.note_templates = load_note_templates()
+            self.playlists = load_playlists()
             # The just-saved doc IS the new on-disk state — use it directly so
             # un-opened actions serialize from current data next save.
             self._scenario_raw = dict(new_doc.get("scenarios", {}))
@@ -11936,6 +11951,25 @@ class App:
     # Action queue — add flow (review at add time; run in a later stage).
     # ==================================================================
 
+    def _queueable_reason(self, scenario) -> Optional[str]:
+        """None if the action can go in the queue; else a short human reason it
+        can't ('single-student' / 'branched' / 'text-only' / 'not found'). The
+        queue commits a stored batch payload, so only standard batch actions
+        qualify today. Shared by the single add path, playlist load, and the
+        playlist manager's action picker."""
+        if scenario is None:
+            return "not found"
+        if scenario.batch is None:
+            return "single-student"
+        if getattr(scenario, "branches", None):
+            return "branched"
+        if self._is_text_only(scenario):
+            return "text-only"
+        return None
+
+    def _is_queueable(self, scenario) -> bool:
+        return self._queueable_reason(scenario) is None
+
     def _queue_add_action(self, scenario: ScenarioConfig) -> None:
         """Review a BATCH action now and add it to the queue (to run later).
         Pops an explanatory dialog for actions that can't be queued (single-
@@ -11945,20 +11979,21 @@ class App:
         from tkinter import messagebox
         name = scenario.name
         # Eligibility: standard batch actions only.
-        if scenario.batch is None:
+        reason = self._queueable_reason(scenario)
+        if reason == "single-student":
             messagebox.showinfo(
                 "Can't queue this action",
                 f"{name!r} runs on a single student, so it doesn't fit the "
                 "queue.\n\nThe queue is for batch actions that fire across the "
                 "caseload. Fire single-student actions directly.")
             return
-        if getattr(scenario, "branches", None):
+        if reason == "branched":
             messagebox.showinfo(
                 "Can't queue this action yet",
                 f"{name!r} is a branched action. Queueing branched actions "
                 "isn't supported yet — fire it directly for now.")
             return
-        if self._is_text_only(scenario):
+        if reason == "text-only":
             messagebox.showinfo(
                 "Can't queue this action yet",
                 f"{name!r} is text-only. Queueing text-only actions isn't "
@@ -11970,16 +12005,33 @@ class App:
                 f"{name!r} is already in the queue. An action can only be "
                 "queued once.")
             return
+        status = self._queue_review_and_add(scenario)
+        if status == "added":
+            try:
+                self.log_tabview.set("Queue")
+            except Exception:
+                pass
+        self._refresh_queue_add_affordance()
+
+    def _queue_review_and_add(self, scenario: ScenarioConfig) -> str:
+        """Run a queue-eligible batch action's review and add it to the queue.
+        Assumes eligibility + dedupe are already checked by the caller. Nothing
+        is sent — the reviewed payload is stored on the queue item and committed
+        only when the queue runs. Returns a status: 'added', 'cancelled' (review
+        cancelled), 'not_ready' (browser), 'placeholder' (sample email gate), or
+        'mongoose' (stale-export gate). Shared by the single add-to-queue path
+        and playlist loading."""
+        name = scenario.name
         if not self.worker.ready_event.is_set():
             self._append_log("Can't queue — browser not ready yet.")
-            return
+            return "not_ready"
         # Same front guards as a direct fire.
         if not self._confirm_no_placeholder_email(scenario):
             self._append_log(
                 f"{name!r}: not queued — sample placeholder email not replaced.")
-            return
+            return "placeholder"
         if not self._mongoose_fresh_gate(scenario):
-            return
+            return "mongoose"
         override = self.course_var.get().strip()
         self._append_log(f"--- Reviewing {name!r} to add to the queue ---")
         self._set_busy(f"Queue: reviewing {name}…")
@@ -11989,7 +12041,7 @@ class App:
             self._set_idle()
         if payload is None:
             self._append_log(f"{name!r}: not added to queue (review cancelled).")
-            return
+            return "cancelled"
         # Review confirmed; nothing runs now (queued for later), so drop the
         # viewer scope that _collect_batch_review set for the review. The 👁 on
         # the queued row re-previews these students on demand.
@@ -12005,10 +12057,119 @@ class App:
             f"✓ Queued {name!r} — {n} student(s) reviewed.", success=True)
         try:
             self.queue_panel.refresh()
-            self.log_tabview.set("Queue")
         except Exception:
             pass
+        return "added"
+
+    def _queue_load_playlist(self, playlist_name: str) -> None:
+        """Load a saved playlist into the queue: review + add each of its
+        eligible batch actions in order. Actions that are missing, already
+        queued, or not queueable are skipped and reported (never silently
+        dropped). The user then presses ▶ Start to run them (per the chosen
+        load-then-Start flow)."""
+        from tkinter import messagebox
+        pl = next((p for p in (self.playlists or [])
+                   if p.name == playlist_name), None)
+        if pl is None:
+            self._append_log(f"Playlist {playlist_name!r} not found.")
+            return
+        if self._is_busy or getattr(self, "_queue_running", False):
+            self._append_log(
+                "Can't load a playlist while a task or the queue is running.")
+            return
+        if not pl.actions:
+            messagebox.showinfo(
+                "Empty playlist",
+                f"{playlist_name!r} has no actions yet. Add some in "
+                "“⚙ Manage playlists”.")
+            return
+        self._append_log(
+            f"--- Loading playlist {playlist_name!r} "
+            f"({len(pl.actions)} action(s)) ---")
+        added = 0
+        skipped: list[str] = []
+        for aname in pl.actions:
+            sc = (self.scenarios or {}).get(aname)
+            reason = self._queueable_reason(sc)  # 'not found' if sc is None
+            if reason:
+                skipped.append(f"{aname!r} ({reason})")
+                continue
+            if self.action_queue.has(aname):
+                skipped.append(f"{aname!r} (already queued)")
+                continue
+            status = self._queue_review_and_add(sc)
+            if status == "added":
+                added += 1
+            elif status == "not_ready":
+                # Browser down — nothing further will work; stop here.
+                skipped.append(f"{aname!r} (browser not ready)")
+                break
+            else:
+                # cancelled / placeholder / mongoose: a per-action decision the
+                # user made — skip this one, keep loading the rest.
+                skipped.append(f"{aname!r} ({status})")
+        if added:
+            try:
+                self.queue_panel.refresh()
+                self.log_tabview.set("Queue")
+            except Exception:
+                pass
+        msg = f"Playlist {playlist_name!r}: queued {added} action(s)"
+        if skipped:
+            msg += f"; skipped {len(skipped)} — " + ", ".join(skipped)
+        self._append_log(msg + ".", success=(added > 0), error=(added == 0))
         self._refresh_queue_add_affordance()
+
+    def _persist_playlists(self) -> None:
+        """Write self.playlists back to scenarios.yaml WITHOUT going through the
+        heavy _save_yaml (which re-serializes every action editor). Targeted
+        read-modify-write: load the current doc, replace just the `playlists:`
+        key, write it back. Keeps the manager's Save cheap and side-effect-free."""
+        try:
+            raw = yaml.safe_load(
+                SCENARIOS_YAML.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            self._append_log(f"Couldn't save playlists: {e}", error=True)
+            return
+        if not isinstance(raw, dict):
+            raw = {}
+        if self.playlists:
+            raw["playlists"] = [playlist_to_dict(p) for p in self.playlists]
+        else:
+            raw.pop("playlists", None)
+        try:
+            SCENARIOS_YAML.write_text(
+                yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                encoding="utf-8")
+        except Exception as e:
+            self._append_log(f"Couldn't save playlists: {e}", error=True)
+            return
+        self.playlists = load_playlists()
+
+    def _open_playlist_manager(self) -> None:
+        """Open the create/edit/delete playlist dialog. On Save it replaces
+        self.playlists, persists them, and refreshes the Queue tab's dropdown."""
+        from src.playlist_manager import open_playlist_manager
+        scen = self.scenarios or {}
+        display_of = {name: self._action_display_name(sc)
+                      for name, sc in scen.items()}
+        status_of = {name: (self._queueable_reason(sc) or "")
+                     for name, sc in scen.items()}
+        eligible = [name for name, sc in scen.items()
+                    if self._is_queueable(sc)]
+
+        def _on_save(new_playlists) -> None:
+            self.playlists = new_playlists
+            self._persist_playlists()   # reassigns self.playlists (normalized)
+            try:
+                self.queue_panel.refresh_playlists()
+            except Exception:
+                pass
+            self._append_log(
+                f"Playlists saved ({len(self.playlists)}).", success=True)
+
+        open_playlist_manager(
+            self.root, self.playlists, eligible, display_of, status_of, _on_save)
 
     def _queue_defer_add(self, name: str) -> None:
         """Remember an action to review + queue once the current run finishes

@@ -645,6 +645,56 @@ def load_note_templates(path: Path = SCENARIOS_YAML) -> list[NoteTemplate]:
     return [t for t in (_note_template_from_dict(x) for x in items) if t]
 
 
+# ----------------------------------------------------------------------
+# Playlists — saved, ordered sets of batch actions the user loads into the
+# Action Queue in one step (e.g. a "Welcome" playlist = the C769 + D502 + C964
+# welcome batches). Stored in scenarios.yaml under a top-level `playlists:`
+# block, parallel to `groups:`/`note_templates:`.
+# ----------------------------------------------------------------------
+@dataclass
+class Playlist:
+    """A named, ordered list of action names to load into the queue together.
+
+    Actions are referenced by name (scenarios are unique by name). A name that
+    no longer resolves to a queueable batch action is skipped at load time and
+    reported — never silently dropped. Order is the order they enter the queue."""
+    name: str
+    actions: list[str] = field(default_factory=list)
+
+
+def playlist_to_dict(p: Playlist) -> dict:
+    """Serialize a Playlist for the scenarios.yaml `playlists:` list."""
+    return {"name": p.name, "actions": list(p.actions)}
+
+
+def _playlist_from_dict(d) -> Optional[Playlist]:
+    if not isinstance(d, dict):
+        return None
+    name = str(d.get("name", "") or "").strip()
+    if not name:
+        return None
+    raw = d.get("actions")
+    actions = ([str(a).strip() for a in raw if str(a).strip()]
+               if isinstance(raw, list) else [])
+    return Playlist(name=name, actions=actions)
+
+
+def load_playlists(path: Path = SCENARIOS_YAML) -> list[Playlist]:
+    """Read the top-level ``playlists:`` list from scenarios.yaml. Optional
+    feature block — missing / empty / parse-error returns ``[]`` (never blocks
+    startup). Playlists without a name are dropped; order is preserved."""
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return []
+    if not isinstance(raw, dict):
+        return []
+    items = raw.get("playlists")
+    if not isinstance(items, list):
+        return []
+    return [p for p in (_playlist_from_dict(x) for x in items) if p]
+
+
 def render_note_template(template: NoteTemplate, values: dict) -> str:
     """Render a filled template into note-body text.
 
