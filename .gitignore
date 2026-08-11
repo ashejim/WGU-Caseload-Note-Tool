@@ -130,3 +130,6 @@ _fresh_demo/
 
 # Per-user learned spell-check words (src/spellcheck.py)
 spell_custom.txt
+
+# Temp grid-probe dump (PII); the running dev instance can recreate it until restart.
+grid_nested_probe.json
