@@ -176,6 +176,84 @@ def test_window_limits_readings():
         os.unlink(db)
 
 
+# ---- §17 validated-signal flags (_signal_flags) --------------------------
+
+def _row(**kw):
+    base = dict(risk=0.02, never_attempted=False, ever_responded=True,
+                days_into_course=100, days_since_contact=5)
+    base.update(kw)
+    return base
+
+
+def test_signal_fresh_never_attempted_not_flagged():
+    # never attempted but only 3 weeks in → benign (§12 time-weighting)
+    f = history._signal_flags(_row(never_attempted=True, days_into_course=21))
+    assert not f["never_attempted_stalled"] and not f["signal_flagged"]
+    assert f["priority"] == 0.02          # unchanged risk
+
+
+def test_signal_stalled_never_attempted_flagged_and_floored():
+    f = history._signal_flags(_row(never_attempted=True, days_into_course=60,
+                                   risk=0.005))
+    assert f["never_attempted_stalled"] and f["signal_flagged"]
+    assert f["signal_flag"] == "stalled"
+    assert f["priority"] == history._SIGNAL_PRIORITY_FLOOR   # floored up
+
+
+def test_signal_silent_requires_contacted_enrolled_noreply_AND_risky():
+    # §18: silence only bites when momentum is ALREADY risky (>=8%).
+    # risky + enrolled + contacted + never replied → silent
+    assert history._signal_flags(
+        _row(ever_responded=False, risk=0.15))["gone_silent"]
+    # momentum-SAFE + silent → NOT flagged (they pass ~98%)
+    assert not history._signal_flags(
+        _row(ever_responded=False, risk=0.02))["gone_silent"]
+    # replied → not silent
+    assert not history._signal_flags(
+        _row(ever_responded=True, risk=0.15))["gone_silent"]
+    # never contacted (no last-contact age) → not silent
+    assert not history._signal_flags(
+        _row(ever_responded=False, risk=0.15, days_since_contact=None))["gone_silent"]
+    # fresh (<6wk) → not silent even if risky + never replied
+    assert not history._signal_flags(
+        _row(ever_responded=False, risk=0.15, days_into_course=20))["gone_silent"]
+
+
+def test_signal_silent_amplifies_risky_to_top():
+    # a risky+silent student is floored to the amplify level (ranks above the
+    # ~29% momentum ceiling — §18 says risky+silent ≈ 53% not-pass)
+    f = history._signal_flags(_row(ever_responded=False, risk=0.12))
+    assert f["gone_silent"] and f["priority"] == history._SILENT_AMPLIFY_FLOOR
+
+
+def test_signal_both_flags_combine():
+    # risky so silence fires too; never-attempted so stalled fires
+    f = history._signal_flags(_row(never_attempted=True, ever_responded=False,
+                                   days_into_course=90, risk=0.15))
+    assert f["signal_flag"] == "stalled+silent" and f["signal_flagged"]
+    assert f["priority"] == history._SILENT_AMPLIFY_FLOOR
+
+
+def test_signal_safe_never_attempted_still_floored():
+    # never-attempted stands alone at ANY momentum (§12) — floored even when safe
+    f = history._signal_flags(_row(never_attempted=True, days_into_course=90,
+                                   risk=0.005, ever_responded=True))
+    assert f["signal_flag"] == "stalled"
+    assert f["priority"] == history._SIGNAL_PRIORITY_FLOOR
+
+
+def test_signal_high_risk_keeps_its_risk_as_priority():
+    # a stalled student already above the 0.08 floor (but not silent) keeps risk
+    f = history._signal_flags(_row(never_attempted=True, days_into_course=90,
+                                   risk=0.25, ever_responded=True))
+    assert f["priority"] == 0.25
+
+
+def test_signal_unflagged_priority_is_risk():
+    f = history._signal_flags(_row(risk=0.13))
+    assert not f["signal_flagged"] and f["priority"] == 0.13
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

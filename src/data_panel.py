@@ -826,6 +826,7 @@ class DataPanel:
         ("student_id", "ID", 76, "center"),
         ("course_code", "Course", 52, "center"),
         ("risk", "Risk", 50, "center"),
+        ("signal_flag", "Flag", 92, "center"),
         ("avg_momentum_rank", "Avg MI", 54, "center"),
         ("trend", "Trend", 48, "center"),
         ("never_attempted", "Never att", 62, "center"),
@@ -887,6 +888,9 @@ class DataPanel:
         # rows (shown only when the toggle is on) grey out regardless.
         tree.tag_configure("hot", foreground="#e0524f")
         tree.tag_configure("warm", foreground="#d99a2b")
+        # §17 validated-signal tier — momentum-safe but never-attempted-stalled or
+        # gone-silent; a distinct blue so it reads as "different axis," not warmer.
+        tree.tag_configure("flag", foreground=("#4a9eff" if dark else "#1f6feb"))
         tree.tag_configure("dismissed", foreground=("#7d7d7d" if dark else "#9a9a9a"))
         tree.grid(row=0, column=0, sticky="nsew")
         sb = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
@@ -912,6 +916,10 @@ class DataPanel:
         active = [r for r in rows if r.get("chase_status") != "dismissed"]
         hi = sum(1 for r in active if (r.get("risk") or 0) >= 0.20)
         never = sum(1 for r in active if r.get("never_attempted"))
+        # §17: momentum-SAFE (<8%) but flagged by a validated signal — the set the
+        # momentum sort used to bury.
+        flag_safe = sum(1 for r in active
+                        if r.get("signal_flagged") and (r.get("risk") or 0) < 0.08)
         contacted = sum(1 for r in active if r.get("chase_status") == "contacted")
         extra = f", {contacted} contacted" if contacted else ""
         win = next((k for k, v in self._AR_WINDOWS.items()
@@ -919,12 +927,14 @@ class DataPanel:
         self.status.configure(text=(
             f"{len(active)} in-progress students ranked by not-pass risk from "
             f"their momentum trajectory ({win}); {hi} at ≥20%, {never} never "
-            f"attempted a task{extra}. 'Risk' = modeled not-pass probability "
-            "(a FLOOR — trust the ordering); 'Avg MI' = mean momentum rank "
-            "(1 Low–5 High); 'Trend' ↑ = recovering (deprioritise), ↓ = sliding. "
-            "'Never att' is a separate acute flag, not in the score. 'Suggested' "
-            "= channel to lead with (* = manual pref). Double-click opens the "
-            "student in the viewer; right-click for actions."))
+            f"attempted a task, {flag_safe} momentum-safe but "
+            f"flagged (blue){extra}. 'Risk' = modeled not-pass probability "
+            "(a FLOOR — trust the ordering); 'Flag' surfaces the validated §-signal "
+            "risks momentum can't see — 'stalled' = never-attempted ≥6wk in, "
+            "'silent' = contacted but never replied (both promoted up the list). "
+            "'Avg MI' = mean momentum rank (1 Low–5 High); 'Trend' ↑ = recovering, "
+            "↓ = sliding. 'Suggested' = channel to lead with (* = manual pref). "
+            "Double-click opens the student in the viewer; right-click for actions."))
 
     def _ar_fill(self, rows) -> None:
         t = self._ar_tree
@@ -934,8 +944,23 @@ class DataPanel:
         for r in rows:
             st = r.get("chase_status") or ""
             risk = r.get("risk") or 0
-            tag = "dismissed" if st == "dismissed" else (
-                "hot" if risk >= 0.20 else ("warm" if risk >= 0.08 else ""))
+            flagged = r.get("signal_flagged")
+            prio = r.get("priority") or risk
+            # Colour precedence by effective PRIORITY (so an amplified risky+silent
+            # student reads red, §18): dismissed > top severity (red — high
+            # momentum OR risky+silent) > validated-signal flag (blue — the
+            # momentum-safe never-attempter §12 rescue, floored to 0.08) > moderate
+            # momentum (amber) > plain.
+            if st == "dismissed":
+                tag = "dismissed"
+            elif prio >= 0.20:
+                tag = "hot"
+            elif flagged:
+                tag = "flag"
+            elif risk >= 0.08:
+                tag = "warm"
+            else:
+                tag = ""
             pref = r.get("contact_pref") or ""
             if pref and r.get("contact_pref_source") == "manual":
                 pref += "*"
@@ -947,6 +972,7 @@ class DataPanel:
                      iid=f"{r['student_id']}|{r['course_code']}",
                      values=(r["name"], r["student_id"], r["course_code"],
                              f"{round(risk * 100)}%",
+                             r.get("signal_flag") or "",
                              f"{r.get('avg_momentum_rank', 0):.1f}", trend,
                              "never" if r.get("never_attempted") else "",
                              sv(r.get("days_since_contact")),

@@ -1643,6 +1643,68 @@ def _actionable_fields(r, e, *, db_path=HISTORY_DB, led=None) -> dict:
     }
 
 
+# §17 (FINDINGS): the two INDEPENDENTLY-VALIDATED risk signals that momentum-risk
+# — a passer-biased FLOOR — structurally can't rank, because a student who never
+# submits or never replies looks "safe" on momentum:
+#   * a STALLED never-attempter (§12 attempt≈pass) — but only once enrolled long
+#     enough to have started (a fresh enrollee is benign; §12 time-weighting), and
+#   * a GONE-SILENT student (§9 non-response separates outcomes) — contacted, yet
+#     never replied on any channel.
+# On the current caseload 16% of students are momentum-"safe" (<8%) but a real
+# signal risk, and all were reachable. So these are promoted to a ranking TIER,
+# not just displayed as flags.
+_SIGNAL_STALL_DAYS = 42          # 6 weeks enrolled: the "should have engaged by now"
+                                 # gate that keeps FRESH students (who simply
+                                 # haven't attempted / replied YET) out of both
+                                 # signals — the §12 time-weighting principle.
+# never-attempted-stalled is floored to the warm boundary so a momentum-SAFE
+# non-attempter still surfaces above the safe crowd (§12: attempting ≈ passing,
+# at any momentum).
+_SIGNAL_PRIORITY_FLOOR = 0.08
+# §18: silence only PREDICTS not-passing when momentum is ALREADY risky —
+# momentum-safe+silent students still pass ~98%, but risky+silent not-pass ~53%
+# (vs 10% responsive). So silence is a risk AMPLIFIER, not a standalone flag: it
+# only fires above this momentum-risk floor, and there it ranks the student at
+# the very top (53% > the ~29% momentum-risk ceiling).
+_SIGNAL_MODERATE_RISK = 0.08
+_SILENT_AMPLIFY_FLOOR = 0.30
+
+
+def _signal_flags(row: dict) -> dict:
+    """Compute the validated-signal flags + a chase `priority` from a row's
+    existing fields (never_attempted, days_into_course, days_since_contact,
+    ever_responded, risk). Both signals need ≥6 weeks enrolled (a fresh student
+    who just hasn't engaged yet isn't flagged, §12). ``never_attempted`` stands
+    alone at any momentum (§12); ``silent`` only bites when momentum is already
+    risky and then amplifies to the top (§18). Merged onto the row."""
+    risk = float(row.get("risk") or 0.0)
+    enrolled = (row.get("days_into_course") or 0) >= _SIGNAL_STALL_DAYS
+    # never attempted despite ≥6 weeks in — the C769 risk (§12), momentum-agnostic.
+    stalled = enrolled and bool(row.get("never_attempted"))
+    # contacted, ≥6wk in, never replied on any channel — but only a signal where
+    # momentum is ALREADY risky (§18); safe+silent students pass ~98%.
+    silent = (enrolled and row.get("days_since_contact") is not None
+              and not row.get("ever_responded")
+              and risk >= _SIGNAL_MODERATE_RISK)
+    parts = []
+    if stalled:
+        parts.append("stalled")
+    if silent:
+        parts.append("silent")
+    priority = risk
+    if stalled:
+        priority = max(priority, _SIGNAL_PRIORITY_FLOOR)
+    if silent:
+        priority = max(priority, _SILENT_AMPLIFY_FLOOR)
+    return {
+        "never_attempted_stalled": stalled,
+        "gone_silent": silent,
+        "signal_flag": "+".join(parts),      # "", "stalled", "silent", "stalled+silent"
+        "signal_flagged": bool(parts),
+        "priority": priority,
+    }
+
+
 # ----------------------------------------------------------------------
 # momentum-trajectory risk model (not-pass probability from momentum history)
 # ----------------------------------------------------------------------
@@ -1821,8 +1883,15 @@ def momentum_risk_students(*, window_weeks: Optional[int] = None,
             "never_attempted": not _has_attempted(r["latest_task_status"], e),
             "days_into_course": days_into,
         })
+        # §17 validated-signal tier: floors gone-silent / stalled-never-attempted
+        # students so the momentum FLOOR can't bury them (adds `priority`).
+        row.update(_signal_flags(row))
         out.append(row)
-    out.sort(key=lambda a: (-a["risk"], a["avg_momentum_rank"],
+    # Rank by chase priority (momentum risk, raised to a floor for signal-flagged
+    # students) first, then the real momentum risk, then avg rank, then neglect —
+    # so genuine high-risk stays on top and momentum-safe-but-flagged surfaces
+    # above the safe crowd instead of at the very bottom.
+    out.sort(key=lambda a: (-a["priority"], -a["risk"], a["avg_momentum_rank"],
                             -(a["days_since_contact"] or 0)))
     return out
 
