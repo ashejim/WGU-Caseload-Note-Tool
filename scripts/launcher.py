@@ -4259,18 +4259,21 @@ class CaseloadPanel:
             font=ctk.CTkFont(size=12, weight="bold"),
         ).pack(anchor="w")
         # Passed-outcomes archive status (the durable record of completions,
-        # ingested from WGU's "passed in last 30 days" view).
+        # ingested from WGU's "passed in last 30 days" view). Kept as a named
+        # label so a successful "Update archive" can refresh its count in place.
+        outcomes_lbl = None
         try:
             oc = history.outcomes_count()
             stale = history.outcomes_stale_days()
             fresh = ("archive never downloaded" if stale is None
                      else f"archive {stale} day(s) old")
-            ctk.CTkLabel(
+            outcomes_lbl = ctk.CTkLabel(
                 hdr,
                 text=f"{oc} resolved outcomes recorded · {fresh}",
                 text_color=("gray40", "gray65"),
                 font=ctk.CTkFont(size=11),
-            ).pack(anchor="w")
+            )
+            outcomes_lbl.pack(anchor="w")
         except Exception:
             pass
 
@@ -4339,11 +4342,9 @@ class CaseloadPanel:
             btns, text="⤓ Export history", width=130,
             command=self._export_history, **SECONDARY_BTN_KWARGS,
         ).pack(side="left")
-        ctk.CTkButton(
-            btns, text="⤓ Update archive", width=140,
-            command=lambda: self.app._update_outcomes_archive(manual=True),
-            **SECONDARY_BTN_KWARGS,
-        ).pack(side="left", padx=(8, 0))
+        update_btn = ctk.CTkButton(
+            btns, text="⤓ Update archive", width=140, **SECONDARY_BTN_KWARGS)
+        update_btn.pack(side="left", padx=(8, 0))
         ctk.CTkButton(
             btns, text="⤒ Ingest archive", width=140,
             command=self._ingest_outcomes_archive, **SECONDARY_BTN_KWARGS,
@@ -4353,6 +4354,42 @@ class CaseloadPanel:
         ctk.CTkButton(
             close_row, text="Close", width=90, command=dlg.destroy,
         ).pack(side="right")
+        # Inline result line so the user sees success + summary here — without
+        # closing this (modal) popup to hunt for it in the activity log.
+        status_lbl = ctk.CTkLabel(
+            close_row, text="", anchor="w", justify="left",
+            font=ctk.CTkFont(size=11), wraplength=420)
+        status_lbl.pack(side="left", fill="x", expand=True)
+
+        def _on_archive_result(ok, summary) -> None:
+            # ok: True (done) / False (failed) / None (in progress).
+            try:
+                if not status_lbl.winfo_exists():
+                    return
+            except Exception:
+                return
+            color = ({True: ("#2e7d32", "#3fb950"),
+                      False: ("#c62828", "#e0524f")}
+                     .get(ok, ("gray40", "gray65")))
+            prefix = {True: "✓ ", False: "✗ ", None: "… "}.get(ok, "")
+            status_lbl.configure(text=prefix + summary, text_color=color)
+            # A successful ingest changes the counts shown above — refresh the
+            # header's "N resolved outcomes recorded" line if it's still live.
+            if ok:
+                try:
+                    oc = history.outcomes_count()
+                    stale = history.outcomes_stale_days()
+                    fresh = ("archive never downloaded" if stale is None
+                             else f"archive {stale} day(s) old")
+                    if outcomes_lbl is not None and outcomes_lbl.winfo_exists():
+                        outcomes_lbl.configure(
+                            text=f"{oc} resolved outcomes recorded · {fresh}")
+                except Exception:
+                    pass
+
+        update_btn.configure(
+            command=lambda: self.app._update_outcomes_archive(
+                manual=True, on_result=_on_archive_result))
 
     def _export_history(self) -> None:
         """Dump the snapshot history to a CSV the user picks (for pandas/Excel)."""
@@ -21671,38 +21708,52 @@ class App:
                 f"Use “⤓ Update archive now” in the Departures view to fetch it "
                 f"automatically.")
 
-    def _update_outcomes_archive(self, manual: bool = True) -> None:
+    def _update_outcomes_archive(self, manual: bool = True,
+                                 on_result=None) -> None:
         """Auto-fetch the 'Archive (Last 30 Days)' view: the worker switches the
         caseload list view, exports it, and switches back; we ingest the CSV
         into history.db's outcomes, refresh the Data panel, and delete the
-        plaintext CSV (it's now in the encrypted DB). Non-fatal."""
+        plaintext CSV (it's now in the encrypted DB). Non-fatal.
+
+        ``on_result(ok, summary)`` — optional callback (main thread) so a caller
+        (e.g. the Departures popup) can show the outcome INLINE, not only in the
+        activity log. ``ok`` is None while in progress, then True/False."""
+        def report(ok, summary, *, error=False, success=False):
+            self._append_log(summary, error=error, success=success)
+            if on_result is not None:
+                try:
+                    on_result(ok, summary)
+                except Exception:
+                    pass
+
         if getattr(self, "_is_busy", False):
             if manual:
-                self._append_log("Busy — try again when the current task finishes.")
+                report(False, "Busy — try again when the current task finishes.",
+                       error=True)
             return
         if not self.worker.ready_event.is_set():
             if manual:
-                self._append_log("Browser not ready yet.")
+                report(False, "Browser not ready yet.", error=True)
             return
         from src import config as _cfg
         dest = _cfg.OUTCOMES_ARCHIVE_DOWNLOAD
-        self._append_log(
-            "Updating passed-outcomes archive (switching to the Archive view "
-            "to export, then back)…")
+        report(None, "Updating passed-outcomes archive (switching to the Archive "
+                     "view to export, then back)…")
 
         def on_done(ok: bool, msg: str) -> None:
             def apply() -> None:
                 if not ok:
-                    self._append_log(f"Archive update failed: {msg}", error=True)
+                    report(False, f"Archive update failed: {msg}", error=True)
                     return
                 try:
                     res = history.ingest_outcomes_csv(str(dest))
                     if res.get("status") == "ok":
-                        self._append_log(
+                        report(
+                            True,
                             f"Archive updated: {res['new']} new, "
                             f"{res['updated']} updated ({res.get('passed', 0)} "
                             f"passed, {res.get('not_passed', 0)} not passed), "
-                            f"{res['total_outcomes']} total.")
+                            f"{res['total_outcomes']} total.", success=True)
                         dp = getattr(self, "data_panel", None)
                         if dp is not None:
                             try:
@@ -21710,11 +21761,12 @@ class App:
                             except Exception:
                                 pass
                     else:
-                        self._append_log(
-                            f"Archive ingest: {res.get('error') or res.get('status')}",
-                            error=True)
+                        report(False,
+                               f"Archive ingest: "
+                               f"{res.get('error') or res.get('status')}",
+                               error=True)
                 except Exception as e:
-                    self._append_log(f"Archive ingest error: {e}", error=True)
+                    report(False, f"Archive ingest error: {e}", error=True)
                 finally:
                     # Drop the plaintext PII CSV — it's captured in history.db now.
                     try:
