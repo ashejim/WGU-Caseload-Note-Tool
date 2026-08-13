@@ -2339,6 +2339,138 @@ def completion_by_month(*, by="start", basis="entry", courses=None,
     return {"months": months}
 
 
+# Contacts-line metric options for the throughput view (label handled in the UI).
+_THROUGHPUT_CONTACTS = ("sent", "unique", "all")
+
+
+def _month_label(mk: str) -> str:
+    """'2026-06' -> 'Jun' (with a 'Jan'26 year tag when the year turns, so
+    cross-year axes stay unambiguous). Falls back to the raw key on any parse
+    failure."""
+    try:
+        dt = datetime.strptime(mk, "%Y-%m")
+        return dt.strftime("%b") if dt.month != 1 else dt.strftime("%b'%y")
+    except Exception:
+        return mk
+
+
+def monthly_throughput(*, db_path=HISTORY_DB, courses=None, contacts="sent",
+                       date_from=None, date_to=None, include_last30=True,
+                       now: Optional[datetime] = None) -> dict:
+    """Caseload THROUGHPUT by month: how many DISTINCT students were assigned to
+    the caseload each month (from the daily snapshots), stacked by course, with a
+    contacts line.
+
+    The live caseload export only shows who is enrolled TODAY, so a snapshot of it
+    understates the real volume handled — students pass or depart and are replaced.
+    Summing the unique students seen in each month's snapshots reveals the actual
+    throughput over time (the "we've served far more than the current headcount"
+    story).
+
+    Unique student assignments: a student counts in month M for course C if any
+    snapshot in M carries (student_id, C). The per-month TOTAL is the sum over
+    courses, so a student enrolled in two courses that month counts once per
+    course — i.e. student-course assignments, matching the stacked bars.
+
+    Contacts (a secondary line) come from the notes history, per month:
+      - "sent"   : outbound outreach events (text / email / call we sent),
+      - "unique" : distinct students we reached (any outbound outreach),
+      - "all"    : every logged note (incl. inbound replies + admin notes).
+
+    ``courses`` (a set) restricts both series; None = all courses. When a strict
+    subset is given, contacts are filtered by the note's (best-effort)
+    ``course_code`` and course-less notes are excluded; with None, every note
+    counts. ``date_from``/``date_to`` bound the calendar months shown.
+
+    ``include_last30`` appends a synthetic trailing bucket (``month='last30'``)
+    for the rolling last 30 days, so recent volume shows even mid-month; it is NOT
+    included in ``avg_load`` (which averages the complete calendar months shown).
+
+    Returns ``{months:[{month,label,by_course:{code:n},total,contacts}],
+    courses:[…], avg_load: float|None, months_count: int}``.
+    """
+    from collections import defaultdict
+    from datetime import timedelta
+    today = (now or datetime.now()).date()
+    lower = _parse_date(date_from) if date_from else None
+    upper = min(_parse_date(date_to) or today, today)
+    d30 = today - timedelta(days=30)
+    sel = set(courses) if courses is not None else None
+
+    def _in_window(d):
+        return d is not None and (lower is None or d >= lower) and d <= upper
+
+    mcs = defaultdict(lambda: defaultdict(set))   # month -> course -> {student}
+    last30_cs = defaultdict(set)                   # course -> {student}
+    mc = defaultdict(int)                          # month -> contacts count
+    m_uniq = defaultdict(set)                      # month -> {student} (unique)
+    last30_contacts = 0
+    last30_uniq: set = set()
+    conn = _connect(db_path)
+    try:
+        for r in conn.execute(
+                "SELECT DISTINCT collected_date, student_id, course_code "
+                "FROM snapshots"):
+            cc = r["course_code"]
+            if not cc or (sel is not None and cc not in sel):
+                continue
+            d = _parse_date(r["collected_date"])
+            if d is None:
+                continue
+            if _in_window(d):
+                mcs[d.isoformat()[:7]][cc].add(r["student_id"])
+            if include_last30 and d30 <= d <= today:
+                last30_cs[cc].add(r["student_id"])
+
+        for r in conn.execute(
+                "SELECT created_at, student_id, course_code, channel, direction "
+                "FROM notes"):
+            cc = r["course_code"] or ""
+            if sel is not None and (not cc or cc not in sel):
+                continue
+            is_outreach = (r["direction"] == "outbound"
+                           and r["channel"] in ("text", "email", "call"))
+            if contacts in ("sent", "unique") and not is_outreach:
+                continue
+            d = _parse_date(r["created_at"])
+            if d is None:
+                continue
+            sid = r["student_id"] or ""
+            if _in_window(d):
+                if contacts == "unique":
+                    if sid:
+                        m_uniq[d.isoformat()[:7]].add(sid)
+                else:
+                    mc[d.isoformat()[:7]] += 1
+            if include_last30 and d30 <= d <= today:
+                if contacts == "unique":
+                    if sid:
+                        last30_uniq.add(sid)
+                else:
+                    last30_contacts += 1
+    finally:
+        conn.close()
+
+    months = []
+    for mk in sorted(mcs):
+        by_course = {c: len(s) for c, s in mcs[mk].items()}
+        con = len(m_uniq[mk]) if contacts == "unique" else mc.get(mk, 0)
+        months.append({"month": mk, "label": _month_label(mk),
+                       "by_course": by_course,
+                       "total": sum(by_course.values()), "contacts": con})
+    avg = (sum(m["total"] for m in months) / len(months)) if months else None
+    months_count = len(months)
+    present_courses = sorted({c for m in months for c in m["by_course"]})
+    if include_last30:
+        by_course = {c: len(s) for c, s in last30_cs.items()}
+        con = len(last30_uniq) if contacts == "unique" else last30_contacts
+        months.append({"month": "last30", "label": "Last 30d",
+                       "by_course": by_course,
+                       "total": sum(by_course.values()), "contacts": con})
+    return {"months": months, "courses": present_courses,
+            "avg_load": avg, "months_count": months_count}
+
+
 def momentum_drift(*, db_path=HISTORY_DB, course_load="all",
                    date_from=None, date_to=None) -> dict:
     """How each entry-band's students MOVED by exit, for the resolved students

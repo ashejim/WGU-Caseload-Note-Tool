@@ -24,12 +24,16 @@ class DataPanel:
               "Momentum risk": "atrisk",
               "Momentum trajectory": "trajectory",
               "Pass rate over time": "overtime",
-              "Completion by month": "completion"}
+              "Completion by month": "completion",
+              "Throughput by month": "throughput"}
     # Short labels for the on-screen view switcher (segmented button — must stay
     # compact so all fit the narrow docked pane).
     _VIEW_LABELS = {"Calibration": "calibration", "Risk": "atrisk",
                     "Trajectory": "trajectory", "Over time": "overtime",
-                    "Completion": "completion"}
+                    "Completion": "completion", "Throughput": "throughput"}
+    # Contacts-line metric for the throughput view (label -> history key).
+    _CONTACTS_METRICS = {"Outreach sent": "sent",
+                         "Unique contacted": "unique", "All notes": "all"}
     # Completion-view month axis (label -> history.completion_by_month `by`).
     _COMPL_BY = {"By course start": "start", "By resolution": "resolution"}
     # Which Momentum reading drives the predicted line (entry vs at-outcome).
@@ -67,6 +71,8 @@ class DataPanel:
         self._traj = None           # trajectory cache
         self._over = None           # over-time cache
         self._compl = None          # completion-by-month cache
+        self._thru = None           # monthly-throughput cache
+        self.contacts_metric = "sent"   # throughput contacts-line metric
         self.compl_by = "start"     # completion month axis
         self.compl_basis = "entry"  # Momentum reading for the predicted line
         self._ar_show_dismissed = False   # risk list: reveal dismissed rows
@@ -138,6 +144,9 @@ class DataPanel:
         elif v == "completion":
             self._build_completion_controls(self.ctrls)
             self._view_completion(self.content)
+        elif v == "throughput":
+            self._build_throughput_controls(self.ctrls)
+            self._view_throughput(self.content)
         else:
             self._build_calibration_controls(self.ctrls)
             self._view_calibration(self.content)
@@ -240,6 +249,9 @@ class DataPanel:
         elif self.view == "completion":
             self._compl = None
             self._render_completion()
+        elif self.view == "throughput":
+            self._thru = None
+            self._render_throughput()
 
     def _select_view(self, key) -> None:
         self.view = key
@@ -328,6 +340,10 @@ class DataPanel:
             if self._compl is not None:
                 self._compl = None
                 self._render_completion()
+        elif self.view == "throughput":
+            if self._thru is not None:
+                self._thru = None
+                self._render_throughput()
         elif self.view == "atrisk":
             self._build_view()
 
@@ -816,6 +832,181 @@ class DataPanel:
                            stipple="gray25", outline=pred_col)
         c.create_text(L + 176, ly - 4, anchor="w", fill=fg, font=("", 8),
                       text="predicted band")
+
+    # ---- view: throughput by month (stacked bars + contacts line) --------
+    def _build_throughput_controls(self, opts) -> None:
+        ctk.CTkLabel(opts, text="Contacts:").pack(side="left", padx=(0, 4))
+        cm = ctk.CTkOptionMenu(
+            opts, width=150, values=list(self._CONTACTS_METRICS),
+            command=lambda v: self._set_contacts_metric(
+                self._CONTACTS_METRICS.get(v, "sent")))
+        cm.set(next((k for k, v in self._CONTACTS_METRICS.items()
+                     if v == self.contacts_metric), "Outreach sent"))
+        cm.pack(side="left")
+        ctk.CTkLabel(opts, text="Courses:").pack(side="left", padx=(10, 4))
+        codes = history.course_codes()
+        if self.courses is None:
+            self.courses = set(codes)
+        for i, code in enumerate(codes):
+            var = ctk.BooleanVar(value=(code in self.courses))
+            color = self._course_color(i)
+            ctk.CTkCheckBox(
+                opts, text=code, variable=var, width=20,
+                checkbox_width=15, checkbox_height=15,
+                font=ctk.CTkFont(size=11), fg_color=color, hover_color=color,
+                command=lambda c=code, vv=var: self._toggle_course(c, vv),
+            ).pack(side="left", padx=(0, 6))
+        self._build_date_control(opts)
+
+    def _set_contacts_metric(self, metric) -> None:
+        self.contacts_metric = metric
+        self._thru = None
+        self._render_throughput()
+
+    def _view_throughput(self, parent) -> None:
+        dark = ctk.get_appearance_mode() == "Dark"
+        self.canvas = tk.Canvas(parent, bd=0, highlightthickness=0,
+                                bg=("#1d1e1e" if dark else "#f9f9fa"))
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.canvas.bind("<Configure>", lambda e: self._on_thru_configure())
+
+    def _on_thru_configure(self) -> None:
+        if self.canvas is None or self.canvas.winfo_width() < 120:
+            return
+        (self._render_throughput() if self._thru is None
+         else self._draw_throughput())
+
+    def _render_throughput(self) -> None:
+        if self.canvas is None:
+            return
+        df, dt_ = self._date_bounds()
+        # Pass None (= all courses, keeps course-less contact notes) when every
+        # course is ticked; a strict subset filters contacts by course too.
+        codes = history.course_codes()
+        sel = (None if (self.courses is None or set(self.courses) >= set(codes))
+               else self.courses)
+        self._thru = history.monthly_throughput(
+            courses=sel, contacts=self.contacts_metric,
+            date_from=df, date_to=dt_)
+        months = self._thru["months"]
+        cal = [m for m in months if m["month"] != "last30"]
+        avg = self._thru.get("avg_load")
+        metric_lbl = {"sent": "outreach events sent",
+                      "unique": "unique students contacted",
+                      "all": "all logged notes"}.get(self.contacts_metric, "")
+        span = (f"{cal[0]['month']} – {cal[-1]['month']}" if cal
+                else "no snapshot history yet")
+        avg_txt = f"{avg:.0f}" if avg is not None else "—"
+        peak = max((m["total"] for m in cal), default=0)
+        self.status.configure(text=(
+            f"Unique students assigned to the caseload each month ({span}), "
+            "stacked by course. The live caseload only shows who's enrolled "
+            "TODAY — this counts everyone handled over time, the real throughput. "
+            f"Average load = {avg_txt} student-assignments/month (peak {peak}); "
+            f"the blue line is {metric_lbl} that month (right axis). 'Last 30d' "
+            "is a rolling recent-volume bar (excluded from the average). A student "
+            "in two courses counts once per course; contacts course-attribution "
+            "is best-effort."))
+        self._draw_throughput()
+
+    def _draw_throughput(self) -> None:
+        c = self.canvas
+        if c is None or not self._thru:
+            return
+        c.delete("all")
+        W, H = c.winfo_width(), c.winfo_height()
+        if W < 160 or H < 120:
+            return
+        dark = ctk.get_appearance_mode() == "Dark"
+        fg = "#c0c0c0" if dark else "#444444"
+        grid = "#333333" if dark else "#dddddd"
+        con_col = "#4a9eff"
+        avg_col = "#888888"
+        months = self._thru["months"]
+        codes = history.course_codes()
+        color_of = {code: self._course_color(i) for i, code in enumerate(codes)}
+        avg = self._thru.get("avg_load")
+        L, R, T, B = 40, 46, 28, 46
+        pw, ph = W - L - R, H - T - B
+        if pw < 60 or ph < 50:
+            return
+        c.create_text(L, 12, anchor="w", fill=fg, font=("", 10, "bold"),
+                      text=("Unique students / month by course  —  avg "
+                            + (f"{avg:.0f}/mo" if avg is not None else "—")))
+        if not months or all(m["total"] == 0 for m in months):
+            c.create_text(W / 2, H / 2, fill=fg,
+                          text="No snapshot history in range yet.")
+            return
+        max_tot = max((m["total"] for m in months), default=1) or 1
+        max_con = max((m["contacts"] for m in months), default=0)
+        n = len(months)
+        slot = pw / n
+
+        def y_ct(v):
+            return T + ph * (1 - v / max_tot)
+
+        def y_con(v):
+            return T + ph * (1 - (v / max_con if max_con else 0))
+
+        for frac in (0, 0.5, 1.0):                       # left axis = student ct
+            y = T + ph * (1 - frac)
+            c.create_line(L, y, L + pw, y, fill=grid)
+            c.create_text(L - 4, y, anchor="e", fill=fg,
+                          text=str(round(max_tot * frac)), font=("", 8))
+        if max_con:                                      # right axis = contacts
+            for frac in (0, 0.5, 1.0):
+                y = T + ph * (1 - frac)
+                c.create_text(L + pw + 6, y, anchor="w", fill=con_col,
+                              text=str(round(max_con * frac)), font=("", 8))
+        if avg is not None and avg > 0:                  # average-load reference
+            ya = y_ct(avg)
+            c.create_line(L, ya, L + pw, ya, fill=avg_col, dash=(4, 3))
+            c.create_text(L + pw, ya - 6, anchor="e", fill=avg_col,
+                          font=("", 7), text=f"avg {avg:.0f}")
+        bw = min(slot * 0.62, 46)
+        con_pts = []
+        for i, m in enumerate(months):
+            cx = L + slot * (i + 0.5)
+            acc = 0
+            for code in codes:                           # stack in stable order
+                cnt = m["by_course"].get(code, 0)
+                if not cnt:
+                    continue
+                c.create_rectangle(cx - bw / 2, y_ct(acc + cnt),
+                                   cx + bw / 2, y_ct(acc),
+                                   fill=color_of.get(code, "#888888"),
+                                   outline="")
+                acc += cnt
+            if m["total"]:
+                c.create_text(cx, y_ct(m["total"]) - 7, text=str(m["total"]),
+                              fill=fg, font=("", 7, "bold"))
+            if max_con:
+                con_pts.append((cx, y_con(m["contacts"])))
+            is30 = m["month"] == "last30"
+            c.create_text(cx, H - B + 12, text=m.get("label") or m["month"],
+                          fill=(con_col if is30 else fg),
+                          font=("", 7, "bold") if is30 else ("", 7))
+        for i in range(len(con_pts) - 1):
+            c.create_line(*con_pts[i], *con_pts[i + 1], fill=con_col, width=2)
+        for cx, cy in con_pts:
+            c.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill=con_col,
+                          outline="")
+        # legend: only courses that actually appear, then the contacts line
+        ly = H - 8
+        lx = L
+        shown = [code for code in codes
+                 if any(m["by_course"].get(code) for m in months)]
+        for code in shown:
+            c.create_rectangle(lx, ly - 7, lx + 12, ly - 1,
+                               fill=color_of.get(code, "#888888"), outline="")
+            c.create_text(lx + 15, ly - 4, anchor="w", fill=fg, text=code,
+                          font=("", 8))
+            lx += 20 + len(code) * 7
+        short = {"sent": "sent", "unique": "reached",
+                 "all": "notes"}.get(self.contacts_metric, "contacts")
+        c.create_line(lx + 4, ly - 4, lx + 26, ly - 4, fill=con_col, width=2)
+        c.create_text(lx + 30, ly - 4, anchor="w", fill=con_col, font=("", 8),
+                      text=f"contacts ({short})")
 
     # ---- view: chase list (table) ---------------------------------------
     # The reachable never-attempted students who most need a nudge (FINDINGS

@@ -3,6 +3,44 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.23.0 — 2026-08-13
+
+- **Data → "Throughput by month" chart.** Shows the **unique students assigned
+  to your caseload each month**, stacked by course — the live caseload only lists
+  who's enrolled *today*, so it hides how many students you actually handle over
+  time as people pass, depart, and get replaced. Includes a **contacts line**
+  (choose *outreach sent*, *unique students reached*, or *all logged notes*), a
+  rolling **Last 30 days** bar, and an **average student-load/month** figure over
+  the shown period. Course filter + date-window controls, drawn as a native
+  chart (no plotting dependency).
+- **Momentum-risk targeting ("Momentum risk" list).** The at-risk list is now
+  ranked by each in-progress student's **momentum-trajectory not-pass
+  probability**, with a momentum window selector, a never-attempted flag on its
+  own axis, and a **validated-signal tier** that surfaces momentum-safe students
+  who are stalled or have gone silent. It's a **persistent worklist** —
+  contacted/dismissed status sticks — and double-click opens the student in the
+  viewer. Risk is also exposed as **filterable caseload columns** (continuous
+  risk score).
+- **Contact-note history.** The app now captures per-student **Salesforce Notes
+  History — including inbound texts and emails** — into the local history DB via
+  persist-on-view plus a change-gated sweep, and can sweep departed students'
+  threads too (reaching students with no stored contact id through global
+  search). This powers a per-student **engagement ledger** (which channel each
+  student actually replies on) and a cost-aware suggestion for what to try next.
+- **Queue playlists.** Save named, ordered sets of batch actions and load a whole
+  set into the Action Queue in one step (review-then-Start), with a Manage
+  dialog.
+- **Clickable EMA task badges for off-caseload shared-course students**, and the
+  **Departures popup now reports the archive-update result inline** (✓/✗ +
+  summary) instead of only in the activity log.
+- **`coursescan` team-roster tooling.** New `coursescan:` probe/capture/export
+  actions dump the accumulated "any course" grid roster for team analysis — with
+  a guard so that roster can **never** pollute your caseload grid (which could
+  otherwise fire actions to hundreds of students).
+- **Fixes.** The caseload works with a slimmed-down list view that omits the Name
+  column (last-known name carried forward), and passers no longer linger as
+  name-less caseload rows.
+
 ## 0.22.0 — 2026-07-29
 
 - **Interactive first-run walkthrough.** New users get an opt-in guided
