@@ -3,6 +3,17 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.23.1 — 2026-08-16
+
+- **Fix: encrypted history could be shadowed by an empty database.** On unlock, a
+  leftover 0-byte plaintext data file (from an interrupted shred on a prior exit)
+  was mistakenly treated as a newer "crash leftover" and kept, so the app ran
+  against an *empty* history — and a subsequent clean exit could then re-encrypt
+  that empty file over the real encrypted store. Decrypt-on-unlock now only keeps
+  a leftover plaintext when it is **non-empty and newer** than its `.enc`;
+  otherwise it restores from the encrypted copy. Affects at-rest-encryption users
+  on 0.23.0.
+
 ## 0.23.0 — 2026-08-13
 
 - **Data → "Throughput by month" chart.** Shows the **unique students assigned

@@ -389,11 +389,19 @@ class ManagedFiles:
             if not enc.exists():
                 continue   # not yet encrypted (pre-migration) — leave plaintext
             try:
-                if plain.exists():
-                    if enc.stat().st_mtime >= plain.stat().st_mtime:
-                        self.vault.decrypt_file(enc, plain)
-                    # else: plaintext is newer (crash leftover) — keep it
-                else:
+                # Decrypt from .enc UNLESS there's a genuine crash-leftover
+                # plaintext worth preserving: one that is NON-EMPTY and strictly
+                # newer than the .enc. A 0-byte (empty) plaintext is NOT a valid
+                # leftover — an interrupted shred/write on the previous exit can
+                # leave one, and treating it as "newer, keep it" would silently
+                # shadow the good .enc with an empty DB (losing all history until
+                # the next re-encrypt clobbers the .enc for real).
+                keep_leftover = (
+                    plain.exists()
+                    and plain.stat().st_size > 0
+                    and plain.stat().st_mtime > enc.stat().st_mtime
+                )
+                if not keep_leftover:
                     self.vault.decrypt_file(enc, plain)
             except Exception as e:
                 errors.append(f"{plain.name}: {e}")
