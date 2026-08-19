@@ -3,6 +3,32 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.24.0 — 2026-08-19
+
+- **Offline demo mode.** Run the whole tool on synthetic sample data with the
+  browser automation off — no Salesforce/Mongoose credentials or login needed.
+  Open it from inside a built app via **⋯ More → 🔌 Try demo mode (sample
+  data)** (launches an isolated demo window alongside your real session, which
+  it never touches; close it from **⋯ More → ← Close demo**), or from source
+  with `demo.bat` / `python -m scripts.demo`. The demo ships a fully-fake
+  caseload (live + departed students, momentum trajectories, outcomes, contact
+  notes). Filing a note there is simulated locally and lands in the Action log;
+  email/text/Salesforce-refresh show a "🔌 Demo" note. Useful for exploring the
+  tool or contributing features (see `CONTRIBUTING.md`).
+- **Contact preference settable in the UI.** Right-click a viewer row →
+  **Contact preference ▸ Auto/Text/Email/Call**, or use the inline selector in
+  the student info view. A manual choice overrides the channel auto-inferred
+  from the student's inbound note history and shows a trailing **`*`** in the
+  grid so manual vs auto is visible at a glance.
+- **Pronouns.** A new manual-only per-student field (blank by default; no feed
+  source), set from a dropdown beside the name in the info view and shown in a
+  **Pronouns** grid column.
+- **Two-column student info view.** The info above the task badges now splits
+  into a general (left) and contact (right) column, with task badges and the
+  follow-up editor full-width below; the narrow docked layout stacks them.
+- **Settings: refresh contact notes.** A button to run the change-gated SF
+  Notes History sweep that feeds the contact-preference inference.
+
 ## 0.23.1 — 2026-08-16
 
 - **Fix: encrypted history could be shadowed by an empty database.** On unlock, a
