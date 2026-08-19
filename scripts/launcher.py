@@ -3837,6 +3837,9 @@ class CaseloadPanel:
         "mentor", "term_end", "timezone", "email", "phone",
         "last_action", "followup", "tasks",
     ]
+    # Pronoun selector choices (manual; no feed source). '—' = blank/unset.
+    _PRONOUN_BLANK = "—"
+    _PRONOUN_CHOICES = ["—", "he/him", "she/her", "they/them"]
 
     def _quickview_field_keys(self) -> list:
         """Configured quick-view field keys in order (Settings →
@@ -3968,11 +3971,24 @@ class CaseloadPanel:
             **SECONDARY_BTN_KWARGS,
         )
         self.detail_collapse_btn.grid(row=0, column=0, padx=(0, 6))
+        name_row = ctk.CTkFrame(hdr, fg_color="transparent")
+        name_row.grid(row=0, column=1, sticky="ew")
         self.qv_name = ctk.CTkLabel(
-            hdr, text="Select a student", anchor="w",
+            name_row, text="Select a student", anchor="w",
             font=ctk.CTkFont(size=14, weight="bold"),
         )
-        self.qv_name.grid(row=0, column=1, sticky="ew")
+        self.qv_name.pack(side="left")
+        # Pronoun selector, right of the name. Manual only — the caseload feed
+        # carries no gender/pronoun data, so it defaults to blank ('—'). Guard
+        # flag suppresses the command while we set the value programmatically.
+        self._pronoun_updating = False
+        self.qv_pronoun_menu = ctk.CTkOptionMenu(
+            name_row, width=104, height=24,
+            values=list(self._PRONOUN_CHOICES),
+            font=ctk.CTkFont(size=11),
+            command=self._on_pronoun_select)
+        self.qv_pronoun_menu.set(self._PRONOUN_BLANK)
+        self.qv_pronoun_menu.pack(side="left", padx=(8, 0))
         # Quick note — file an ad-hoc note for the selected student (blue, next
         # to Review notes). Also on the Ctrl+Shift+N hotkey. On/off caseload.
         self.quick_note_btn = ctk.CTkButton(
@@ -4056,6 +4072,10 @@ class CaseloadPanel:
         self.qv_body = ctk.CTkFrame(self.qv_col, fg_color="transparent")
         self.qv_body.grid(row=0, column=0, sticky="new", padx=4, pady=(2, 4))
         self.qv_body.grid_columnconfigure(1, weight=1)
+        # Current target frame for the shared info-field renderers (_qv_field,
+        # _qv_id_row, …). Normally qv_body; show_quick_view re-points it at the
+        # left / right / full-width sub-frames to lay the info out in two columns.
+        self._qv_grid = self.qv_body
         self.qv_ea_frame = ctk.CTkFrame(
             self.qv_col, fg_color=("gray90", "gray22"), corner_radius=6)
         self.qv_ea_frame.grid(row=1, column=0, sticky="new", padx=4,
@@ -4698,14 +4718,55 @@ class CaseloadPanel:
         if pref and pref.lower() not in name.lower():
             title = f"{title}  ·  {pref}"
         self.qv_name.configure(text=title)
+        self._update_pronoun_menu(row)
 
-        # Pinned identifiers at the top of the student info, each with a
-        # Copy button right beside the value: Student ID then Mobile. Shown
-        # regardless of the configurable field set (they're essential).
-        r = self._qv_id_row(0, row)
-        r = self._qv_mobile_row(r, row)
+        # The info above the task badges is laid out in two side-by-side
+        # columns (when there's horizontal room — i.e. not the narrow layout):
+        #   LEFT  — general info (Student ID, mentor, term/IC dates, course, …)
+        #   RIGHT — contact info (Mobile, Email, Timezone, Contact preference)
+        # Task badges, the follow-up note, and the follow-up editor span the
+        # FULL width below both columns. In the narrow layout the three groups
+        # simply stack (general → contact → full-width) in one column.
+        two_col = not self._narrow
+        self._qv_twocol = two_col
+        if two_col:
+            wrapper = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+            wrapper.grid(row=0, column=0, columnspan=2, sticky="new")
+            wrapper.grid_columnconfigure(0, weight=1, uniform="qv")
+            wrapper.grid_columnconfigure(1, weight=1, uniform="qv")
+            left = ctk.CTkFrame(wrapper, fg_color="transparent")
+            left.grid(row=0, column=0, sticky="new", padx=(0, 8))
+            right = ctk.CTkFrame(wrapper, fg_color="transparent")
+            right.grid(row=0, column=1, sticky="new")
+            full = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+            full.grid(row=1, column=0, columnspan=2, sticky="new")
+        else:
+            left = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+            left.grid(row=0, column=0, columnspan=2, sticky="new")
+            right = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+            right.grid(row=1, column=0, columnspan=2, sticky="new")
+            full = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+            full.grid(row=2, column=0, columnspan=2, sticky="new")
+        for col in (left, right, full):
+            col.grid_columnconfigure(1, weight=1)
+
+        # LEFT: pinned Student ID, then the general configured fields.
+        # RIGHT: a "Contact" header, the pinned Mobile, then contact fields.
+        self._qv_grid = left
+        rL = self._qv_id_row(0, row)
+        self._qv_grid = right
+        ctk.CTkLabel(
+            right, text="Contact", anchor="w",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray45", "gray60"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 1))
+        rR = self._qv_mobile_row(1, row)
+        rF = 0
         catalog = {k: (label, csv, kind)
                    for k, label, csv, kind in self.QUICK_VIEW_CATALOG}
+        # Contact-column fields (the rest go to the general/left column); wide
+        # or long fields span the full width below both columns.
+        contact_keys = {"email", "timezone"}
         for key in self._quickview_field_keys():
             ent = catalog.get(key)
             if not ent:
@@ -4717,12 +4778,26 @@ class CaseloadPanel:
                 continue
             label, csv_key, kind = ent
             if kind == "tasks":
-                self._qv_task_badges(r, row)
-                r += 1
+                self._qv_grid = full
+                self._qv_task_badges(rF, row)
+                rF += 1
+            elif kind == "longtext":
+                self._qv_grid = full
+                rF = self._qv_field(rF, row, label, csv_key, kind)
+            elif key in contact_keys:
+                self._qv_grid = right
+                rR = self._qv_field(rR, row, label, csv_key, kind)
             else:
-                r = self._qv_field(r, row, label, csv_key, kind)
-        # Editable follow-up date (writes back to Salesforce).
-        r = self._qv_followup_editor(r, row)
+                self._qv_grid = left
+                rL = self._qv_field(rL, row, label, csv_key, kind)
+        # Contact preference (+ inline Auto/Text/Email/Call setter) — always
+        # shown in the contact column, below the reachable channels.
+        self._qv_grid = right
+        rR = self._qv_contact_pref_row(rR, row)
+        # Editable follow-up date (writes back to Salesforce) — full width.
+        self._qv_grid = full
+        rF = self._qv_followup_editor(rF, row)
+        self._qv_grid = self.qv_body
         # Notes-column header: last action + latest course note pinned atop
         # the notes (the at-a-glance context, kept on screen above them).
         self._qv_render_notehead(row)
@@ -4765,11 +4840,11 @@ class CaseloadPanel:
         if not sid:
             return r
         ctk.CTkLabel(
-            self.qv_body, text="Student ID:", anchor="nw",
+            self._qv_grid, text="Student ID:", anchor="nw",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=("gray35", "gray70"), width=70,
         ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
-        vf = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+        vf = ctk.CTkFrame(self._qv_grid, fg_color="transparent")
         vf.grid(row=r, column=1, sticky="ew", pady=1)
         # Spacer column 2 absorbs the slack so the copy icon hugs the value.
         vf.grid_columnconfigure(2, weight=1)
@@ -4787,23 +4862,143 @@ class CaseloadPanel:
         if not mobile:
             return r
         ctk.CTkLabel(
-            self.qv_body, text="Mobile:", anchor="nw",
+            self._qv_grid, text="Mobile:", anchor="nw",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=("gray35", "gray70"), width=70,
         ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
-        vf = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+        vf = ctk.CTkFrame(self._qv_grid, fg_color="transparent")
         vf.grid(row=r, column=1, sticky="ew", pady=1)
         vf.grid_columnconfigure(2, weight=1)   # spacer keeps the icon close
         link_color = ("#1f6feb", "#58a6ff")
         v = ctk.CTkLabel(
             vf, text=mobile, anchor="w", justify="left",
-            wraplength=(320 if not self._narrow else 180),
+            wraplength=(150 if getattr(self, "_qv_twocol", False)
+                        else 320 if not self._narrow else 180),
             font=ctk.CTkFont(size=12), text_color=link_color, cursor="hand2",
         )
         v.bind("<Button-1>", lambda e, m=mobile: self._open_tel(m))
         v.grid(row=0, column=0, sticky="w")
         self._copy_icon_btn(vf, mobile).grid(row=0, column=1, padx=(4, 0))
         return r + 1
+
+    def _qv_contact_pref_row(self, r, row) -> int:
+        """Contact preference with an inline setter. 'Auto' = the channel
+        auto-inferred from the student's inbound note history; Text/Email/Call =
+        a manual instructor override that wins over the inference (persisted to
+        history.student_flags via set_contact_preference). The caption shows what
+        is active and where it came from (manual vs auto)."""
+        sid = self._cell(row, "StudentID")
+        if not sid:
+            return r
+        try:
+            cp = history.contact_preference(sid)
+        except Exception:
+            cp = {"pref": "", "source": "none"}
+        pref, source = cp.get("pref", ""), cp.get("source", "none")
+        ctk.CTkLabel(
+            self._qv_grid, text="Contact pref:", anchor="nw",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray35", "gray70"), width=70,
+        ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+        vf = ctk.CTkFrame(self._qv_grid, fg_color="transparent")
+        vf.grid(row=r, column=1, sticky="ew", pady=1)
+        vf.grid_columnconfigure(1, weight=1)
+        _disp = {"text": "Text", "email": "Email", "call": "Call"}
+        # The menu reflects the OVERRIDE state: a manual pref shows that channel;
+        # anything else (auto-inferred or none) shows 'Auto'.
+        current = _disp.get(pref, "Auto") if source == "manual" else "Auto"
+        menu = ctk.CTkOptionMenu(
+            vf, width=88, height=24, values=["Auto", "Text", "Email", "Call"],
+            font=ctk.CTkFont(size=11),
+            command=lambda choice, s=sid, rw=row: self._set_contact_pref(
+                s, choice, rw))
+        menu.set(current)
+        menu.grid(row=0, column=0, sticky="w")
+        if source == "manual":
+            cap, col = "manually set", ("#1f6feb", "#58a6ff")
+        elif source == "auto":
+            cap, col = f"auto: {pref}", ("gray45", "gray60")
+        else:
+            cap, col = "no replies yet", ("gray45", "gray60")
+        ctk.CTkLabel(
+            vf, text=cap, anchor="w", font=ctk.CTkFont(size=11),
+            text_color=col,
+        ).grid(row=0, column=1, sticky="w", padx=(6, 0))
+        return r + 1
+
+    def _set_contact_pref(self, sid, choice, row=None) -> None:
+        """Apply a manual contact-preference override ('Auto' clears it back to
+        the note-history inference) and refresh the viewer cell + detail pane in
+        place. Shared by the info-view selector and the row right-click menu."""
+        pref = {"Auto": "", "Text": "text", "Email": "email",
+                "Call": "call"}.get(choice, "")
+        try:
+            history.set_contact_preference(sid, pref)
+            resolved = history.contact_preference(sid)
+        except Exception as e:
+            self.app._append_log(f"Couldn't set contact preference: {e}")
+            return
+        # Mirror onto every cached row for this student so the ContactPref column
+        # reflects it immediately, without waiting for a full caseload reload.
+        for rr in (self.app._caseload_rows or []):
+            if self._cell(rr, "StudentID") == sid:
+                rr["ContactPref"] = resolved.get("pref", "")
+                rr["_contact_pref_source"] = resolved.get("source", "")
+        self.populate()
+        # Re-render the detail pane if this student is the one on screen.
+        cur = getattr(self, "_qv_row", None)
+        if cur is not None and self._cell(cur, "StudentID") == sid:
+            self.show_quick_view(cur)
+        verb = "cleared (auto)" if not pref else f"set to {pref}"
+        name = (self._cell(row, "Name") if row else "") or sid
+        self.app._append_log(f"Contact preference for {name} {verb}.")
+
+    def _update_pronoun_menu(self, row) -> None:
+        """Point the header pronoun selector at the shown student's stored value
+        (blank '—' when unset or when there's no Student ID to key on)."""
+        menu = getattr(self, "qv_pronoun_menu", None)
+        if menu is None:
+            return
+        sid = self._cell(row, "StudentID") if row else ""
+        cur = ""
+        if sid:
+            try:
+                cur = history.student_pronouns(sid)
+            except Exception:
+                cur = ""
+        self._pronoun_updating = True
+        try:
+            # A stored value outside the presets (hand-edited DB) still shows.
+            vals = list(self._PRONOUN_CHOICES)
+            if cur and cur not in vals:
+                vals.append(cur)
+            menu.configure(values=vals)
+            menu.set(cur or self._PRONOUN_BLANK)
+        finally:
+            self._pronoun_updating = False
+
+    def _on_pronoun_select(self, choice) -> None:
+        """Persist the chosen pronouns for the shown student ('—' clears) and
+        refresh the Pronouns column in place."""
+        if getattr(self, "_pronoun_updating", False):
+            return
+        row = getattr(self, "_qv_row", None)
+        sid = self._cell(row, "StudentID") if row else ""
+        if not sid:
+            return
+        val = "" if choice == self._PRONOUN_BLANK else choice
+        try:
+            history.set_student_pronouns(sid, val)
+        except Exception as e:
+            self.app._append_log(f"Couldn't set pronouns: {e}")
+            return
+        for rr in (self.app._caseload_rows or []):
+            if self._cell(rr, "StudentID") == sid:
+                rr["Pronouns"] = val
+        self.populate()
+        name = self._cell(row, "Name") or sid
+        self.app._append_log(
+            f"Pronouns for {name} " + (f"set to {val}." if val else "cleared."))
 
     def _qv_render_ea(self, row) -> None:
         """Fill the right-hand Essential Actions panel for this student
@@ -5050,7 +5245,7 @@ class CaseloadPanel:
         if not sid:
             return r
         cur = self._cell(row, "CourseFollowupDate")
-        frame = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+        frame = ctk.CTkFrame(self._qv_grid, fg_color="transparent")
         frame.grid(row=r, column=0, columnspan=2, sticky="ew",
                    padx=4, pady=(4, 2))
         frame.grid_columnconfigure(4, weight=1)
@@ -5178,16 +5373,17 @@ class CaseloadPanel:
                 return r
 
         lbl = ctk.CTkLabel(
-            self.qv_body, text=f"{label}:", anchor="nw",
+            self._qv_grid, text=f"{label}:", anchor="nw",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=("gray35", "gray70"), width=70,
         )
         lbl.grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
-        valframe = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+        valframe = ctk.CTkFrame(self._qv_grid, fg_color="transparent")
         valframe.grid(row=r, column=1, sticky="ew", pady=1)
         # Spacer column 2 absorbs slack so a copy icon hugs the value.
         valframe.grid_columnconfigure(2, weight=1)
-        wrap = 320 if not self._narrow else 180
+        wrap = (150 if getattr(self, "_qv_twocol", False)
+                else 320 if not self._narrow else 180)
         vlbl = ctk.CTkLabel(
             valframe, text=val, anchor="w", justify="left",
             wraplength=wrap, font=ctk.CTkFont(size=12),
@@ -5334,7 +5530,7 @@ class CaseloadPanel:
                                  error=True)
 
     def _qv_task_badges(self, r, row) -> None:
-        bar = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+        bar = ctk.CTkFrame(self._qv_grid, fg_color="transparent")
         bar.grid(row=r, column=0, columnspan=2, sticky="w", pady=(4, 1))
         ctk.CTkLabel(
             bar, text="Tasks:", font=ctk.CTkFont(size=11, weight="bold"),
@@ -6955,6 +7151,9 @@ class CaseloadPanel:
         # shows more than name (phone/email/etc.) and can be searched by it.
         self._upsert_offcaseload_row(contact_id, name, profile)
         # This student isn't on the caseload — clear the caseload-only panels.
+        # Off-caseload renders straight into qv_body (no two-column split), so
+        # reset the shared render target after any prior caseload view.
+        self._qv_grid = self.qv_body
         for w in self.qv_body.winfo_children():
             w.destroy()
         for w in self.qv_notehead.winfo_children():
@@ -6969,6 +7168,7 @@ class CaseloadPanel:
         except Exception:
             pass
         self.qv_name.configure(text=f"🔎 {name or '(unknown)'}")
+        self._update_pronoun_menu(self._qv_row)
 
         r = 0
         ctk.CTkLabel(
@@ -7553,6 +7753,14 @@ class CaseloadPanel:
         live status hasn't been scraped yet shows ⚪ ("not loaded"). Non-task
         columns and empty cells pass through unchanged. Only the DISPLAY is
         decorated — sort/filter/search still run on the raw CSV dict."""
+        # Contact preference: flag a manual instructor override with a trailing
+        # '*' (matches the Data → Risk view), so manual vs auto-inferred is
+        # visible at a glance in the grid.
+        if header == "ContactPref":
+            v = str(r.get("ContactPref", "") or "")
+            if v and r.get("_contact_pref_source") == "manual":
+                v += " *"
+            return v
         raw = fmt_date_short(r.get(header, ""))
         tnum = task_cols.get(header)
         if not tnum or not raw:
@@ -7826,6 +8034,30 @@ class CaseloadPanel:
         menu.add_command(
             label="🔓 Unlock tasks (EA dashboard)…",
             command=lambda s=_sid, l=label: self.app._open_ea_dashboard(s, l))
+        # Contact preference: set/clear the manual channel override right here.
+        if _sid:
+            try:
+                cur_cp = history.contact_preference(_sid)
+            except Exception:
+                cur_cp = {"pref": "", "source": "none"}
+            manual = cur_cp.get("source") == "manual"
+            cur_pref = cur_cp.get("pref", "")
+            cp_menu = tk.Menu(menu, tearoff=0)
+
+            def _cp_label(text, is_current):
+                return ("● " if is_current else "    ") + text
+
+            cp_menu.add_command(
+                label=_cp_label("Auto (clear override)", not manual),
+                command=lambda s=_sid, r=row: self._set_contact_pref(
+                    s, "Auto", r))
+            for ch, val in (("Text", "text"), ("Email", "email"),
+                            ("Call", "call")):
+                cp_menu.add_command(
+                    label=_cp_label(ch, manual and cur_pref == val),
+                    command=lambda s=_sid, c=ch, r=row: self._set_contact_pref(
+                        s, c, r))
+            menu.add_cascade(label="Contact preference", menu=cp_menu)
         fire_index = None
         nonbatch = self._panel_action_scenarios()
         if nonbatch:
@@ -16003,6 +16235,13 @@ class App:
                         for x in history.momentum_risk_students()}
         except Exception:
             risk_map = {}
+        # Instructor-entered pronouns (manual only; blank for everyone else),
+        # keyed by normalised student id so it fills for scored AND unscored rows.
+        try:
+            pron_map = {_nsid(k): v
+                        for k, v in history.all_student_pronouns().items()}
+        except Exception:
+            pron_map = {}
 
         def _num(v):
             return "" if v is None else v
@@ -16039,12 +16278,16 @@ class App:
                 r["MomentumTrend"] = mr.get("trend", "")
                 r["NeverAttempted"] = "Yes" if mr.get("never_attempted") else "No"
                 r["ContactPref"] = mr.get("contact_pref", "") or ""
+                r["_contact_pref_source"] = mr.get("contact_pref_source", "") or ""
             else:
                 r["MomentumRisk"] = ""
                 r["AvgMomentumRank"] = ""
                 r["MomentumTrend"] = ""
                 r["NeverAttempted"] = ""
                 r["ContactPref"] = ""
+                r["_contact_pref_source"] = ""
+            # Instructor-entered pronouns (blank unless manually set).
+            r["Pronouns"] = pron_map.get(sid.lstrip("0"), "")
             # PM email captured from a prior fire/email for this student — used
             # by the panel email-click CC (real address vs the name fallback).
             pm = pm_by_sid.get(sid)
@@ -18622,6 +18865,65 @@ class App:
             dialog, textvariable=req_ignore_var, width=420,
             placeholder_text="LatestCourseNote, MyCourseContact",
         ).pack(anchor="w", padx=32, pady=(0, 12))
+
+        # ---- Contact notes (per-student SF Notes History capture) ----
+        ctk.CTkFrame(dialog, height=1, fg_color=("gray70", "gray35")).pack(
+            fill="x", padx=20, pady=(2, 8))
+        ctk.CTkLabel(
+            dialog, text="Contact notes",
+            font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 2))
+        ctk.CTkLabel(
+            dialog,
+            text="Capture the latest per-student contact notes (texts, emails, "
+                 "calls) into the local history for engagement analysis. This "
+                 "isn't automatic — snapshots refresh on their own, but notes only "
+                 "update when you run this. It drives the browser (run while away) "
+                 "and only re-scrapes students with newer activity than we've "
+                 "stored.",
+            wraplength=510, justify="left", anchor="w",
+            text_color=("gray45", "gray60"), font=ctk.CTkFont(size=11),
+        ).pack(fill="x", padx=32, pady=(0, 4))
+
+        def _fmt_swept() -> str:
+            try:
+                f = history.notes_freshness()
+            except Exception:
+                return "Contact notes: status unavailable."
+            if not f["count"]:
+                return "No contact notes captured yet."
+            last = (f["last_swept"] or "")[:10] or "unknown"
+            newest = (f["newest_note"] or "")[:10] or "unknown"
+            return (f"{f['count']:,} notes stored · last refreshed {last} · "
+                    f"newest note {newest}")
+
+        notes_status_lbl = ctk.CTkLabel(
+            dialog, text=_fmt_swept(), wraplength=510, justify="left",
+            anchor="w", text_color=("gray35", "gray70"),
+            font=ctk.CTkFont(size=11))
+        notes_status_lbl.pack(fill="x", padx=32, pady=(0, 6))
+
+        def _refresh_notes() -> None:
+            # Close Settings first so the browser it drives isn't buried behind
+            # this modal (front-load-before-nav), then start the change-gated sweep.
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._sweep_note_history(force=False, scope="caseload")
+
+        notes_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        notes_row.pack(fill="x", padx=32, pady=(0, 12))
+        ctk.CTkButton(
+            notes_row, text="⟳ Refresh contact notes", width=200,
+            command=_refresh_notes,
+        ).pack(side="left")
+        ctk.CTkButton(
+            notes_row, text="Full re-scrape", width=120,
+            command=lambda: (win.destroy(),
+                             self._sweep_note_history(force=True, scope="caseload")),
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(8, 0))
 
         dialog = tab_actions
         # ---- Actions ----

@@ -213,10 +213,13 @@ CREATE INDEX IF NOT EXISTS ix_notes_channel ON notes(channel, direction);
 -- values (contact preference from note history, chase-list membership from the
 -- live criteria) are computed on the fly. contact_pref: 'text'/'email'/'call'
 -- set by the instructor (e.g. "student wants texts only") — takes precedence
--- over the auto-inferred preference.
+-- over the auto-inferred preference. pronouns: free-form manual label
+-- (e.g. 'she/her') — the caseload feed carries no gender/pronoun data, so this
+-- is instructor-entered and blank by default.
 CREATE TABLE IF NOT EXISTS student_flags (
     student_id   TEXT PRIMARY KEY,
     contact_pref TEXT,
+    pronouns     TEXT,
     updated_at   TEXT
 );
 
@@ -253,6 +256,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         _migrate_v1_to_v2(conn)
     conn.executescript(_SCHEMA_DDL)  # create from scratch / fill in any gaps
     _ensure_outcome_columns(conn)    # additive columns on an existing outcomes
+    _ensure_student_flag_columns(conn)  # additive columns on existing flags
     conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
     conn.commit()
 
@@ -269,6 +273,15 @@ def _ensure_outcome_columns(conn: sqlite3.Connection) -> None:
     for name, typ in add.items():
         if name not in cols:
             conn.execute(f"ALTER TABLE outcomes ADD COLUMN {name} {typ}")
+
+
+def _ensure_student_flag_columns(conn: sqlite3.Connection) -> None:
+    """Add later-introduced student_flags columns (e.g. pronouns) to a
+    pre-existing table. Cheap + idempotent."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(student_flags)")}
+    for name, typ in {"pronouns": "TEXT"}.items():
+        if name not in cols:
+            conn.execute(f"ALTER TABLE student_flags ADD COLUMN {name} {typ}")
 
 
 def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
@@ -750,6 +763,49 @@ def _manual_contact_pref(student_id: str, *, db_path=HISTORY_DB) -> str:
         conn.close()
 
 
+def set_student_pronouns(student_id: str, pronouns: str, *,
+                         db_path=HISTORY_DB, now: Optional[datetime] = None):
+    """Manually set a student's pronouns (free-form, e.g. 'she/her'); '' clears
+    them. The caseload feed carries no gender/pronoun data, so this is purely
+    instructor-entered."""
+    pronouns = (pronouns or "").strip()
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
+    conn = _connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO student_flags (student_id, pronouns, updated_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(student_id) DO UPDATE SET "
+                "pronouns = excluded.pronouns, updated_at = excluded.updated_at",
+                (student_id, pronouns, ts))
+    finally:
+        conn.close()
+
+
+def student_pronouns(student_id: str, *, db_path=HISTORY_DB) -> str:
+    """A student's manually-set pronouns, or '' if none."""
+    conn = _connect(db_path)
+    try:
+        r = conn.execute("SELECT pronouns FROM student_flags WHERE "
+                         "student_id = ?", (student_id,)).fetchone()
+        return (r["pronouns"] or "") if r else ""
+    finally:
+        conn.close()
+
+
+def all_student_pronouns(*, db_path=HISTORY_DB) -> dict:
+    """{student_id -> pronouns} for every student with a non-blank manual value.
+    One query so the caseload derived-columns pass can fill the column without a
+    per-row lookup."""
+    conn = _connect(db_path)
+    try:
+        return {r["student_id"]: r["pronouns"] for r in conn.execute(
+            "SELECT student_id, pronouns FROM student_flags "
+            "WHERE pronouns IS NOT NULL AND pronouns != ''")}
+    finally:
+        conn.close()
+
+
 def contact_preference(student_id: str, *, db_path=HISTORY_DB,
                        _ledger=None) -> dict:
     """A student's contact preference: the channel they actually engage on.
@@ -792,6 +848,22 @@ def notes_last_stored(*, db_path=HISTORY_DB) -> dict:
         return {r["contact_id"]: r["newest"] for r in conn.execute(
             "SELECT contact_id, MAX(created_at) AS newest FROM notes "
             "WHERE contact_id != '' GROUP BY contact_id") if r["newest"]}
+    finally:
+        conn.close()
+
+
+def notes_freshness(*, db_path=HISTORY_DB) -> dict:
+    """Contact-note freshness for the Settings status line:
+    ``{'count', 'last_swept', 'newest_note'}``. ``last_swept`` = when a sweep last
+    captured anything (max last_seen_at); ``newest_note`` = the most recent note's
+    authored date we hold (max created_at). Both ISO strings or None."""
+    conn = _connect(db_path)
+    try:
+        r = conn.execute(
+            "SELECT COUNT(*) c, MAX(last_seen_at) ls, MAX(created_at) nc "
+            "FROM notes").fetchone()
+        return {"count": r["c"] or 0, "last_swept": r["ls"] or None,
+                "newest_note": r["nc"] or None}
     finally:
         conn.close()
 

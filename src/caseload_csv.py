@@ -78,6 +78,7 @@ DISPLAY_TO_CSV: dict[str, str] = {
     "Momentum Trend": "MomentumTrend",             # >0 recovering, <0 sliding
     "Never Attempted": "NeverAttempted",           # Yes / No
     "Contact Preference": "ContactPref",           # text / email / call
+    "Pronouns": "Pronouns",                         # instructor-entered; blank default
 }
 
 
