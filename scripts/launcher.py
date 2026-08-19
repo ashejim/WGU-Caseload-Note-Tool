@@ -8530,7 +8530,14 @@ class App:
             getattr(self.settings, "note_save_via_api", True))
         self.worker.text_api_enabled = bool(
             getattr(self.settings, "text_send_via_api", False))
-        self.worker.start()
+        # Offline/demo mode (scripts/demo.py sets CASELOAD_OFFLINE=1): run entirely
+        # off local sample data — never launch the browser or touch Salesforce/
+        # Mongoose. Otherwise start the worker's browser session normally.
+        self._offline = os.environ.get("CASELOAD_OFFLINE") == "1"
+        if self._offline:
+            self._enable_offline_demo()
+        else:
+            self.worker.start()
         self._cleanup_sensitive_artifacts()   # purge old captures/probes/shots
 
         self.hotkey_listener: Optional[keyboard.Listener] = None
@@ -8567,8 +8574,10 @@ class App:
 
         # Once the worker has the browser open, auto-refresh the
         # caseload CSV in the background so the first batch fire is
-        # instant. Failures log a hint but never block startup.
-        self.root.after(500, self._poll_worker_then_auto_download)
+        # instant. Failures log a hint but never block startup. Skipped in the
+        # offline demo (no browser / no Salesforce to download from).
+        if not self._offline:
+            self.root.after(500, self._poll_worker_then_auto_download)
 
         # One-time heads-up if this machine has no Outlook Classic (email
         # sending needs it — "new Outlook"/web can't be automated).
@@ -13216,14 +13225,17 @@ class App:
             # in Salesforce. Record it for the walkthrough's "reviewed the
             # pop-up" checklist item (harmless otherwise).
             self._note_fill_started = scenario.name
-            self.worker.submit_scenario(
-                scenario, note_override, clipboard,
-                custom_bodies=custom_bodies,
-                prompt_vars=prompt_vars, ea=ea_arg,
-                # Single-student fire: if the note is left for review (submit
-                # off), surface the browser so the user sees the filled form.
-                raise_on_review=True,
-            )
+            if getattr(self, "_offline", False):
+                self._demo_record_scenario_note(scenario, note_override)
+            else:
+                self.worker.submit_scenario(
+                    scenario, note_override, clipboard,
+                    custom_bodies=custom_bodies,
+                    prompt_vars=prompt_vars, ea=ea_arg,
+                    # Single-student fire: if the note is left for review (submit
+                    # off), surface the browser so the user sees the filled form.
+                    raise_on_review=True,
+                )
 
     def _fire_record_only(self, scenario: ScenarioConfig, student_id: str,
                           course_raw: str, who: str) -> None:
@@ -13832,6 +13844,12 @@ class App:
     def _send_text_blocking(self, payload: dict) -> Optional[dict]:
         """Queue a SEND_TEXT and block the main thread until the worker returns
         {ok}/{error}."""
+        if getattr(self, "_offline", False):
+            who = str(payload.get("student_id") or payload.get("mobile")
+                      or "the student").strip()
+            self._append_log(
+                f"🔌 Demo: would text {who} via Mongoose — simulated, not sent.")
+            return {"ok": True, "demo": True}
         done_var = tk.BooleanVar(value=False)
         holder: dict = {"res": None}
 
@@ -16584,6 +16602,13 @@ class App:
                                     allow_deeplink: bool = True) -> bool:
         """Navigate to a student and block until the note panel is loaded.
         (Blocking convenience wrapper around _start_navigate_for_fire.)"""
+        if getattr(self, "_offline", False):
+            # Demo: there's no browser to open. Remember who we're 'firing' on so
+            # the note-submit seam can record the action locally.
+            self._demo_fire_student = (query, student_id)
+            self._append_log(
+                f"🔌 Demo: opened {student_id or query} (simulated — no browser).")
+            return True
         return self._start_navigate_for_fire(
             query, student_id=student_id, allow_deeplink=allow_deeplink)()
 
@@ -16641,6 +16666,11 @@ class App:
         where row_info carries `student_email`/`pm_email` (empty on the
         deep-link path) and the `contact_id` harvested from the opened
         record. Either email can be empty if the page didn't surface it."""
+        if getattr(self, "_offline", False):
+            # Demo: no browser navigation. Remember the student so the note-submit
+            # seam records it, and report success so the batch loop proceeds.
+            self._demo_fire_student = (query, "")
+            return True, {"pm_email": "", "student_email": "", "contact_id": ""}
         done_var = tk.BooleanVar(value=False)
         holder: dict = {
             "success": False,
@@ -17208,6 +17238,45 @@ class App:
         self.root.wait_variable(done_var)
         return holder["cols"]
 
+    def _demo_record_scenario_note(self, scenario, override) -> bool:
+        """Offline demo: instead of filing the note in Salesforce, record it
+        LOCALLY through the same _record_note path a real fire uses — so it lands
+        in the Action log + note_log.csv (driving the info view's 'Last action')
+        and marks any success-path step, exactly as it would live. Returns True."""
+        from datetime import datetime as _dt
+        q, sid = getattr(self, "_demo_fire_student", ("", ""))
+        sid, q = str(sid or "").strip(), str(q or "").strip()
+        row = None
+        for r in (self._caseload_rows or []):
+            rid = str(r.get("StudentID", "") or r.get("Student ID", "")).strip()
+            nm = str(r.get("Name", "")).strip()
+            # The query is the row's unique value — usually a Student ID, but a
+            # Name on some paths; match either, and the stashed sid when present.
+            if (sid and rid == sid) or (q and (rid == q or nm == q)):
+                row = r
+                break
+        name = (str(row.get("Name", "")).strip() if row else "") or q or sid
+        course = (str(override or "").strip()
+                  or (str(row.get("CourseCode", "")).strip() if row else ""))
+        entry = NoteLogEntry(
+            timestamp=_dt.now(),
+            scenario=scenario.name,
+            course_code=course,
+            student=name,
+            student_id=(sid or (str(row.get("StudentID", "")).strip()
+                                if row else "")),
+            student_email=(str(row.get("StudentEmail", "")).strip()
+                           if row else ""),
+            pm_name=(str(row.get("MentorName", "")).strip() if row else ""),
+            pm_email="",
+            submitted=True,
+        )
+        self._record_note(entry)
+        self._append_log(
+            f"✓ Demo: filed note '{scenario.name}' for {name or 'student'} — "
+            "recorded locally (no Salesforce).")
+        return True
+
     def _submit_scenario_blocking(
         self, scenario: ScenarioConfig, override: str,
         clipboard: str, custom_bodies: dict[int, str],
@@ -17218,6 +17287,8 @@ class App:
         completion. Returns True iff the run completed without
         errors — the batch loop uses this for honest processed-vs-
         skipped accounting."""
+        if getattr(self, "_offline", False):
+            return self._demo_record_scenario_note(scenario, override)
         done_var = tk.BooleanVar(value=False)
         holder: dict = {"success": False}
 
@@ -17251,6 +17322,12 @@ class App:
         `<STUDENT EMAIL>` placeholder, which Outlook will reject if
         the user tries Send). The Yes/No modal gates the batch:
         Yes → loop with auto-send, No → abort."""
+        if getattr(self, "_offline", False):
+            self._append_log(
+                f"🔌 Demo: would preview the email template "
+                f"'{getattr(email_cfg, 'body_html_file', '')}' for "
+                f"{n_students} student(s) — skipped, no Outlook in the demo.")
+            return True
         from tkinter import messagebox
         from src import outlook_email
 
@@ -17365,6 +17442,14 @@ class App:
 
         Returns True to proceed with the note step (or, in
         auto_send mode, True if Send() succeeded). False aborts."""
+        if getattr(self, "_offline", False):
+            to = str(student_ctx.get("student_email", "")
+                     or student_ctx.get("student", "")).strip()
+            self._append_log(
+                f"🔌 Demo: would email {to or 'the student'} "
+                f"(template '{getattr(email_cfg, 'body_html_file', '')}') — "
+                "skipped, no Outlook in the demo.")
+            return True
         from tkinter import messagebox
         from src import outlook_email
 
@@ -22234,6 +22319,43 @@ class App:
                           file=sys.stderr)
         except Exception as e:
             print(f"Lock-on-exit failed: {e}", file=sys.stderr)
+
+    def _enable_offline_demo(self) -> None:
+        """Wire the offline demo: the browser worker's thread is NOT started, so
+        nothing touches Salesforce/Mongoose. Every queued command is intercepted
+        and answered with a friendly no-op (and any result callback is fired with
+        an empty value) so a curious click explains itself instead of hanging.
+        The whole read/analysis UI still runs off the local sample data."""
+        try:
+            self.worker.ready_event.set()   # unblock anything gating on 'ready'
+        except Exception:
+            pass
+
+        def _offline_put(cmd) -> None:
+            # The shutdown sentinel isn't an action — swallow it silently.
+            if cmd is getattr(self.worker, "SHUTDOWN", object()):
+                return
+            self._append_log(
+                "🔌 Demo mode — this action uses the live Salesforce/Mongoose "
+                "connection, which is off in the offline demo. Everything else "
+                "(viewer, student info, Data/Risk views) works on the sample data.")
+            # Fire any callback carried by the command so callers waiting on a
+            # result re-enable instead of spinning. Empty/falsy = "nothing done".
+            if isinstance(cmd, tuple):
+                for a in cmd:
+                    if not callable(a):
+                        continue
+                    try:
+                        a({})
+                    except TypeError:
+                        try:
+                            a(False)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+        self.worker.q.put = _offline_put
 
     def _on_close(self) -> None:
         # If an action/process is still running (a batch fire, note save,

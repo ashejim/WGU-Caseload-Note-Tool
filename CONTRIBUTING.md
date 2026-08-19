@@ -10,6 +10,60 @@ assumes you have never used Git before.
 
 ---
 
+## Try it first: the offline demo (no login needed)
+
+The tool normally drives a live **Salesforce** caseload and **Mongoose** texting
+session through a browser — so you'd need WGU credentials to use it for real. For
+contributing, you don't. There's a **fully offline demo** that runs the whole app
+against a synthetic sample caseload, with the browser automation turned off:
+
+```bash
+python -m scripts.demo        # Windows: demo.bat
+python -m scripts.demo --reset  # rebuild the fake data from scratch
+```
+
+(First set up the Python environment: create a virtualenv and
+`pip install -r requirements.txt`.)
+
+This launches in an isolated `_demo/` sandbox (its own settings, no global
+hotkeys, no browser, never touches any real data). **Everything that reads local
+data works** — the caseload viewer, the student info view, the Data tab
+(Risk / momentum / throughput / calibration), filters, contact preferences,
+pronouns.
+
+**Firing actions is simulated locally**, so you can see the whole workflow:
+picking a student and filing a note runs the real review dialogs, then records
+the note into the Action log + the info view's "Last action" (and marks any
+success-path step) — all against the sample data, with nothing sent to
+Salesforce. Emails / texts and "refresh from Salesforce" log a "🔌 Demo" note
+instead of touching the live systems (that automation layer is intentionally
+inert here).
+
+### The sample data
+
+- **`scripts/sample_data.py`** generates it: ~16 "live" students plus ~24
+  resolved (departed) ones, 8 weeks of momentum trajectories, pass/not-pass
+  outcomes, and a few contact notes — all **fake** (invented names, `9000…` ids,
+  `555-01xx` phones, `example.edu` emails; **never real student data**). It seeds
+  everything through the real `src/history.py` APIs, so the DB schema is always
+  correct.
+- **`sample_data/sample_caseload.csv`** is a committed, browsable copy of the
+  roster so you can see the data shape on GitHub without running anything.
+- Regenerate the committed copy with `python -m scripts.sample_data`.
+
+### Good first features to build against it
+
+Because the demo has real data flowing, UI and analysis work is easy to build and
+see. For example, **Objective Assessments (OAs):** today the app tracks
+performance-assessment tasks (the `Task1/2/3` badges). An OA view/column would
+slot in alongside — the grid feed already exposes `LatestTask*` fields, and the
+sample generator can be extended with OA attempt data. Start in the caseload
+viewer (`CaseloadPanel` in `scripts/launcher.py`) or the `DataPanel`
+(`src/data_panel.py`), and add sample values in `scripts/sample_data.py` so your
+feature has something to render.
+
+---
+
 ## 0. One-time setup
 
 **a) Make a GitHub account** — go to [github.com](https://github.com) and sign up (free).
