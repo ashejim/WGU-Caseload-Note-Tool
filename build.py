@@ -122,6 +122,15 @@ def main() -> None:
         stray.unlink()
         print(f"Removed stray {stray.relative_to(project_root)}")
 
+    # Generate the synthetic sample data the in-app "Try demo mode" toggle
+    # ships with (caseload.csv + seeded history.db under sample_data/). The spec
+    # bundles them; the toggle copies them into an isolated demo config dir.
+    print("Generating offline-demo sample data...")
+    subprocess.run(
+        [sys.executable, "-m", "scripts.sample_data"],
+        check=True, cwd=project_root,
+    )
+
     print(f"Building CaseloadNotes v{__version__}...")
     subprocess.run(
         [sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm",

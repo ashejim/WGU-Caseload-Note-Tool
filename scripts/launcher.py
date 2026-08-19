@@ -9054,12 +9054,68 @@ class App:
         menu.add_separator()
         menu.add_command(label="↻  Restart browser",
                          command=self._restart_browser)
+        # Offline demo: launch a self-contained sample-data instance (or, when
+        # this IS the demo, close it). Isolated config — never touches real data.
+        menu.add_separator()
+        if getattr(self, "_offline", False):
+            menu.add_command(label="←  Close demo", command=self._on_close)
+        else:
+            menu.add_command(label="🔌  Try demo mode (sample data)…",
+                             command=self._launch_demo_instance)
         try:
             x = self._btn_more.winfo_rootx()
             y = self._btn_more.winfo_rooty() + self._btn_more.winfo_height()
             menu.tk_popup(x, y)
         finally:
             menu.grab_release()
+
+    def _launch_demo_instance(self) -> None:
+        """Open the OFFLINE DEMO in a new window: the whole tool on synthetic
+        sample data, no browser/login. Runs ALONGSIDE this instance in a fully
+        isolated config dir, so the real session/data is never touched. From
+        source this reuses scripts/demo.py (fresh data each run); in a frozen
+        build it seeds a demo config dir from the bundled sample data and
+        relaunches the exe in offline mode."""
+        import subprocess
+        import shutil
+        from src import config
+        try:
+            self._append_log(
+                "🔌 Launching the offline demo (sample data) in a new window — "
+                "your real session is untouched…")
+            if not config._is_frozen():
+                subprocess.Popen([sys.executable, "-m", "scripts.demo"],
+                                 cwd=str(config.PROJECT_ROOT))
+                return
+            # Frozen build: seed a sibling demo config dir from the bundled
+            # sample data, then relaunch this exe pointed at it, offline.
+            demo_dir = Path(config.USER_CONFIG_DIR).parent / "caseload-notes-demo"
+            demo_dir.mkdir(parents=True, exist_ok=True)
+            bundle = config._bundle_root()
+            seed = (bundle / "sample_data") if bundle else None
+            missing = []
+            for fn in ("caseload.csv", "history.db"):
+                src_f = (seed / fn) if seed else None
+                dst_f = demo_dir / fn
+                if dst_f.exists():
+                    continue
+                if src_f and src_f.exists():
+                    shutil.copyfile(src_f, dst_f)
+                else:
+                    missing.append(fn)
+            if missing:
+                self._append_log(
+                    "  ↳ demo unavailable: this build wasn't packaged with "
+                    f"sample data ({', '.join(missing)}).")
+                return
+            env = os.environ.copy()
+            env["CASELOAD_OFFLINE"] = "1"
+            env["CASELOAD_CONFIG_DIR"] = str(demo_dir)
+            env["CASELOAD_NO_HOTKEYS"] = "1"
+            env["CASELOAD_TITLE_SUFFIX"] = "   ●  OFFLINE DEMO (sample data)"
+            subprocess.Popen([sys.executable], env=env)
+        except Exception as e:
+            self._append_log(f"Couldn't launch the demo: {e}")
 
     # Ordered toolbar spec: (button, wide label OR callable(narrow)->text,
     # wide width, narrow glyph). Dynamic-label buttons (editor/viewer) pass a

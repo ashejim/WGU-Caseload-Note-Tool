@@ -33,6 +33,13 @@ tzdata_datas = collect_data_files("tzdata")
 spell_datas = [d for d in collect_data_files("spellchecker")
                if os.path.basename(d[0]) == "en.json.gz"]
 
+# Synthetic sample data for the in-app "Try demo mode" toggle (offline demo).
+# build.py generates these before the build; bundled so a downloaded app can seed
+# an isolated demo config dir from them. Fully fake (no PII).
+sample_datas = [(p, "sample_data") for p in
+                ("sample_data/caseload.csv", "sample_data/history.db")
+                if os.path.exists(p)]
+
 a = Analysis(
     ["scripts/launcher.py"],
     pathex=["."],
@@ -44,6 +51,7 @@ a = Analysis(
         *ctk_datas,
         *tzdata_datas,
         *spell_datas,
+        *sample_datas,     # offline-demo sample caseload + seeded history.db
     ],
     hiddenimports=[
         "customtkinter",

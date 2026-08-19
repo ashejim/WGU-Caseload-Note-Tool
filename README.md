@@ -214,6 +214,21 @@ fresh_demo.bat            # or: python -m scripts.fresh_demo
 fresh_demo.bat --reset    # wipe back to a clean first-run
 ```
 
+**Offline demo (no login)** — run the whole tool on synthetic sample data with
+the browser automation off. No Salesforce/Mongoose credentials needed; ideal for
+contributors exploring or adding features (see `CONTRIBUTING.md`):
+
+```powershell
+demo.bat                  # or: python -m scripts.demo
+demo.bat --reset          # rebuild the fake sample caseload from scratch
+```
+
+In a **downloaded/built app**, open the demo from inside the tool:
+**⋯ More → 🔌 Try demo mode (sample data)**. It launches an isolated demo window
+alongside your real session (its own config, never touches real data); close it
+from **⋯ More → ← Close demo**. Firing a note there is simulated locally (it lands
+in the Action log), while email/text/Salesforce-refresh show a "🔌 Demo" note.
+
 ## Building a distributable
 
 ```powershell
