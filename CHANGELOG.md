@@ -3,6 +3,34 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.25.0 — 2026-09-06
+
+- **Inbox labeler.** While the app is open, a background pass tags mail in the
+  configured Outlook folder(s) with two categories — the student's **course
+  code** and their **CI's first name** — so anyone viewing a shared inbox sees
+  whose student each email is. Senders are matched to students through the
+  CourseScan roster; unknown senders get **Unidentified** and students with no
+  assigned CI get **Unassigned**. It only ever *adds* categories — it never
+  moves, edits, or removes mail, and never touches teammates' personal
+  subfolders. Mail that arrived while the app was closed is caught up on the
+  next launch. Configure it under **Settings → Inbox labeler** (toggle,
+  folders, courses, check interval, **Label now**, **Refresh roster** with a
+  live coverage readout). An automated whole-course **roster refresh** keeps
+  identification current against WGU's rolling course starts. Requires Outlook
+  Classic (COM); off by default.
+- **Local caseload backup + recovery guide.** A tool to export the app's local
+  caseload history to plain CSV (last-known snapshot per student + the passers
+  outcomes archive) as a hedge against Salesforce inconsistencies or a system
+  migration, plus a colleague-facing recovery handout. Backups stay local and
+  out of version control (plaintext student PII).
+- **Fix: browser recovers from a closed window or a cold-start Edge crash.** If
+  the automation browser goes away — the window is closed, or Edge crashes
+  during the Salesforce SSO warm-up — the worker now detects the dead session,
+  reopens it (your login survives on disk), and replays the pending action, so
+  a refresh/fire "just works" instead of failing until a manual restart. The
+  startup caseload load also waits out a mid-launch reopen instead of dropping
+  to the degraded CSV fallback.
+
 ## 0.24.0 — 2026-08-19
 
 - **Offline demo mode.** Run the whole tool on synthetic sample data with the
