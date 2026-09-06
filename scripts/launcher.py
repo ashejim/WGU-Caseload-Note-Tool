@@ -17769,12 +17769,16 @@ class App:
                     # first render (SSO redirect chain + getCaseLoadMainGridData
                     # Aura call), so the initial table wait times out even though
                     # a manual ↻ Caseload a few seconds later loads instantly.
-                    # Retry once automatically after a warm-up delay rather than
+                    # Retry automatically after a warm-up delay rather than
                     # making the user click ↻ Caseload on every launch. The
+                    # budget is 4 attempts because Edge 152 can CRASH during the
+                    # cold-SSO window (browser-process bug, auto-reopened by the
+                    # worker) — each crash burns an attempt, and giving up here
+                    # leaves the session on the view-dependent CSV fallback. The
                     # message also covers the genuinely-not-signed-in case so the
                     # user isn't left waiting blind either way.
                     tries = getattr(self, "_startup_caseload_tries", 1)
-                    if tries < 2 and self.worker.ready_event.is_set():
+                    if tries < 4 and self.worker.ready_event.is_set():
                         self._startup_caseload_tries = tries + 1
                         self._append_log(
                             "Caseload didn't load yet — Salesforce may still be "
@@ -17797,16 +17801,26 @@ class App:
                 pass
 
         def _retry_startup_caseload() -> None:
-            # Skip if the user has started something (the download would conflict)
-            # or the browser went away — in those cases ↻ Caseload is theirs to
-            # press. Otherwise re-run the same load through the same on_done.
-            if getattr(self, "_is_busy", False) or not self.worker.ready_event.is_set():
+            # Skip if the user has started something (the download would
+            # conflict) — in that case ↻ Caseload is theirs to press. A
+            # not-ready browser is NOT a reason to give up: a cold-start Edge
+            # crash mid-reopen lands exactly here, so keep checking until the
+            # worker's auto-reopen brings the browser back (bounded so a
+            # never-returning browser doesn't poll forever).
+            if getattr(self, "_is_busy", False):
+                return
+            if not self.worker.ready_event.is_set():
+                waits = getattr(self, "_startup_caseload_waits", 0)
+                if waits < 12:  # ~2 min of reopen grace across the retries
+                    self._startup_caseload_waits = waits + 1
+                    self.root.after(10000, _retry_startup_caseload)
                 return
             self._set_busy("Auto-refreshing caseload…")
             self._append_log("Retrying caseload load…")
             self.worker.submit_download_caseload_csv(CASELOAD_CSV_PATH, on_done)
 
         self._startup_caseload_tries = 1
+        self._startup_caseload_waits = 0
         self.worker.submit_download_caseload_csv(CASELOAD_CSV_PATH, on_done)
 
     def _open_panel_actions_dialog(self, parent=None) -> None:

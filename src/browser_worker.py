@@ -587,6 +587,17 @@ class BrowserWorker:
                     cb({"ok": True})
                 except Exception:
                     pass
+            # A command that found the previous browser closed is replayed
+            # first, so the user's refresh/fire "just works" after the reopen.
+            replay = getattr(self, "_replay_cmd", None)
+            if replay is not None:
+                self._replay_cmd = None
+                try:
+                    self._dispatch_command(ctx, replay)
+                except Exception as e:
+                    self.on_status(
+                        f"Command {replay[0]!r} failed after the browser "
+                        f"reopened: {e}")
             while True:
                 cmd = self.q.get()
                 if cmd is self.SHUTDOWN:
@@ -601,13 +612,65 @@ class BrowserWorker:
                     self._pending_restart_cb = on_done
                     self.on_status("Restarting browser…")
                     return True  # _run reopens the context
+                dead_reason = self._ctx_dead_reason(ctx)
+                if dead_reason:
+                    # The browser/context is gone (window closed, Edge exited,
+                    # or the Playwright driver died and took Edge with it).
+                    # Reopen a fresh session (the disk profile keeps the SSO
+                    # login) and replay this command against it. The reason is
+                    # logged verbatim to tell those cases apart — cleanly
+                    # closed windows say "closed", a dead driver says
+                    # "Connection closed"/EPIPE-ish.
+                    self.ready_event.clear()
+                    self._browser_hwnd = None
+                    self._browser_pid = None
+                    self._replay_cmd = cmd
+                    self.on_status(
+                        "Browser connection lost — reopening… "
+                        f"(reason: {dead_reason[:140]})")
+                    return True  # _run reopens the context, then replays
                 try:
                     self._dispatch_command(ctx, cmd)
                 except Exception as e:
+                    if self._dead_browser_error(e):
+                        # Browser died mid-command. This command already
+                        # reported its failure (handlers own their callbacks)
+                        # — don't replay it, but reopen so the NEXT one works.
+                        self.ready_event.clear()
+                        self._browser_hwnd = None
+                        self._browser_pid = None
+                        self.on_status(
+                            "Browser closed during the last action — "
+                            "reopening…")
+                        return True
                     self.on_status(
                         f"Command {cmd[0]!r} failed: {e}. Worker still "
                         "running; use \u21bb Restart browser if it's stuck."
                     )
+
+    @staticmethod
+    def _dead_browser_error(e: Exception) -> bool:
+        """Does this exception mean the browser/context is GONE (user closed
+        the window, browser crashed) rather than a page-level failure?"""
+        msg = str(e)
+        return ("browser has been closed" in msg
+                or "context or browser has been closed" in msg
+                or "Browser closed" in msg
+                or "has been disconnected" in msg
+                or "Connection closed" in msg)
+
+    @staticmethod
+    def _ctx_dead_reason(ctx) -> str:
+        """Cheap liveness probe run before each command: cookies() is a real
+        driver round-trip, so it raises once the browser is gone (client-side
+        properties like ctx.pages don't notice). Returns "" while alive, else
+        the first line of the failure — the reason distinguishes a closed
+        window from a dead Playwright driver."""
+        try:
+            ctx.cookies()
+            return ""
+        except Exception as e:
+            return (str(e) or type(e).__name__).splitlines()[0]
 
     def _dispatch_command(self, ctx, cmd) -> None:
         """Dispatch one queued command. Each branch is responsible for

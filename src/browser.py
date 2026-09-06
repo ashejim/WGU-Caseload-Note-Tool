@@ -6,6 +6,54 @@ from playwright.sync_api import BrowserContext, sync_playwright
 from src.config import BROWSER_DATA_DIR
 
 
+def _kill_stale_profile_edge() -> None:
+    """Kill leftover msedge.exe processes still holding OUR automation
+    profile (browser_data). When Edge crashes, its background helpers can
+    outlive the window and keep the user-data dir locked — the next launch
+    then starts and immediately dies, in a loop ("Browser window was closed
+    — reopening…" over and over; observed live 2026-08-31). Only processes
+    whose command line references our profile dir are touched — the user's
+    personal Edge is untouched. Windows-only, best-effort, silent."""
+    import subprocess
+    import sys as _sys
+    if not _sys.platform.startswith("win"):
+        return
+    needle = str(BROWSER_DATA_DIR)
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
+          "Where-Object { $_.CommandLine -like '*" + needle + "*' } | "
+          "ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force "
+          "-ErrorAction Stop } catch {} }")
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        pass
+
+
+def _mark_profile_clean() -> None:
+    """Reset the profile's crashed-exit flag before launch. After a real
+    crash the profile stays marked `exit_type: Crashed` (seen live after the
+    2026-08-30 Edge-update crashes), which changes Edge's startup behavior
+    (session-restore prompts / recovery paths) for every later session.
+    Standard automation hygiene: stamp it Normal pre-launch — the browser
+    isn't running at this point (the stale-process sweep just ran)."""
+    import json
+    prefs = BROWSER_DATA_DIR / "Default" / "Preferences"
+    try:
+        with open(prefs, encoding="utf-8") as f:
+            data = json.load(f)
+        prof = data.setdefault("profile", {})
+        if prof.get("exit_type") != "Normal":
+            prof["exit_type"] = "Normal"
+            prof["exited_cleanly"] = True
+            with open(prefs, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+    except Exception:
+        pass
+
+
 @contextmanager
 def persistent_context(headless: bool = False) -> Iterator[BrowserContext]:
     """Launch Microsoft Edge with a persistent user-data dir so SSO/
@@ -18,6 +66,10 @@ def persistent_context(headless: bool = False) -> Iterator[BrowserContext]:
     available on the user's machine.
     """
     BROWSER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # A crashed previous session can leave Edge helpers holding the profile
+    # lock — clear them so this launch doesn't die instantly (crash loop).
+    _kill_stale_profile_edge()
+    _mark_profile_clean()
     # These flags are best-effort mitigations for Chromium backgrounding
     # / throttling behaviors that affect Playwright-launched browsers:
     # - `--disable-blink-features=AutomationControlled` + dropping
@@ -44,10 +96,19 @@ def persistent_context(headless: bool = False) -> Iterator[BrowserContext]:
             # the process is restarted. Disable the Chromium throttles AND Edge's
             # sleeping-tab/efficiency features. Unknown feature names are ignored
             # by Chromium, so the best-guess Edge names are harmless if wrong.
+            # msImplicitSignin / msSeamlessWebToBrowserSignIn: when the WGU
+            # Microsoft SSO page loads, Edge tries to sign the BROWSER
+            # PROFILE into the managed tenant and can RESTART ITSELF to
+            # apply org policies — observed live 2026-09-01 as a clean Edge
+            # exit ~10s after launch on cold-SSO startups (no crash dump,
+            # no event-log entry). Disabling implicit profile sign-in stops
+            # the self-restart; web SSO cookies are unaffected.
             "--disable-features="
             "CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,"
-            "msSleepingTabs,msEfficiencyMode,HeavyAdIntervention",
+            "msSleepingTabs,msEfficiencyMode,HeavyAdIntervention,"
+            "msImplicitSignin,msSeamlessWebToBrowserSignIn",
             "--disable-background-mode",
+            "--disable-sync",
         ],
         ignore_default_args=["--enable-automation"],
     )
