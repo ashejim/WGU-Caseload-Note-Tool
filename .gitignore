@@ -74,6 +74,11 @@ mongoose*.csv
 # Single-instance lock file (runtime).
 launcher.lock
 
+# Local caseload CSV backups (scripts/export_caseload_backup.py) — full student
+# PII in PLAINTEXT, FERPA. The root-level /*.csv rule above doesn't reach a
+# subfolder, so exclude the whole backups dir explicitly. Never commit.
+backups/
+
 # Local working folder of source/branding art — includes THIRD-PARTY logos
 # (Salesforce, Mongoose) and large source GIFs. Never commit: trademark/
 # copyright + repo bloat. Shipped app assets live in resources/ (app.ico,
