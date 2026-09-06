@@ -522,6 +522,30 @@ class Settings:
     # ACI once (ACIs are colleagues, so a small reused set); editable in
     # Settings. Preferred over any first.last@wgu.edu guess, which is unreliable.
     aci_emails: dict = field(default_factory=dict)
+    # Inbox labeler (src/inbox_labeler.py): background pass that applies
+    # Outlook categories (course code + CI first name) to mail in the
+    # configured folder(s), identifying senders via coursescan_roster.json.
+    # Non-destructive: only ever ADDS categories, never moves/edits mail.
+    inbox_labeler_enabled: bool = False
+    # Folders to scan, comma/newline separated. A bare mailbox name means
+    # its Inbox ("UG Capstone IT"); Inbox subfolders and personal folders
+    # work too ("Students"). Empty = the built-in default (the team box).
+    inbox_labeler_folders: str = ""
+    # Course codes to label, comma/newline separated. Students matched in
+    # other courses get "Unidentified". Empty = the built-in default
+    # (the team's course list in src/inbox_labeler.py).
+    inbox_labeler_courses: str = ""
+    # Minutes between background passes while the app is open.
+    inbox_labeler_interval_min: int = 5
+    # Each pass looks back this many days, so mail that arrived while the
+    # app was closed is picked up on the next launch's catch-up pass.
+    inbox_labeler_lookback_days: int = 3
+    # Auto-refresh the CourseScan roster (the labeler's identification
+    # database) shortly after startup when the exported file is older than
+    # this many hours — WGU's rolling starts assign students to CIs all
+    # month, so a stale roster steadily grows the Unidentified pile.
+    # 0 = never auto-refresh (manual 'rosterscan:' / button only).
+    inbox_labeler_roster_max_age_hours: int = 24
 
 
 def load_settings() -> Settings:

@@ -6352,6 +6352,14 @@ class CaseloadPanel:
             else:
                 self.app._probe_grid_courses()
             return "break"
+        # "rosterscan:" — AUTOMATED whole-course roster refresh (no manual
+        # scrolling): the worker switches to the Any Course view, auto-scrolls
+        # each configured course, and the roster is exported when done.
+        # "rosterscan: C769 D502" limits it to those courses.
+        if q.lower().startswith("rosterscan"):
+            rest = q.split(":", 1)[1].strip() if ":" in q else ""
+            self.app._roster_scan_auto(rest.split() if rest else None)
+            return "break"
         # DIAGNOSTIC: "griddiff:" compares the intercepted grid JSON against the
         # CSV column by column (writes griddiff_report.txt) — proves whether the
         # JSON can replace the CSV before switching the data path. Read-only.
@@ -8582,6 +8590,18 @@ class App:
         # One-time heads-up if this machine has no Outlook Classic (email
         # sending needs it — "new Outlook"/web can't be automated).
         self.root.after(700, self._maybe_outlook_classic_notice)
+
+        # Background inbox labeler (src/inbox_labeler.py): applies course/CI
+        # categories to team-inbox mail while the app is open. The thread
+        # always starts (cheap; idles when the toggle is off) so enabling it
+        # in Settings takes effect without a restart. Skipped in offline demo.
+        self._labeler_thread = None
+        if not self._offline:
+            self.root.after(1500, self._start_inbox_labeler)
+            # Rolling starts assign students to CIs all month — refresh the
+            # roster automatically when it's stale. Deferred a minute so the
+            # scan queues behind the startup caseload/EA/task work.
+            self.root.after(60_000, self._maybe_auto_roster_refresh)
 
     # ----- Main (left) pane -----
 
@@ -19549,6 +19569,102 @@ class App:
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
 
+        # ---- Inbox labeler: auto-categorize team-inbox mail ----
+        ctk.CTkFrame(dialog, height=1, fg_color=("gray70", "gray35")).pack(
+            fill="x", padx=20, pady=(2, 8))
+        from src import inbox_labeler as _il
+        labeler_var = ctk.BooleanVar(
+            value=getattr(self.settings, "inbox_labeler_enabled", False))
+        ctk.CTkCheckBox(
+            dialog,
+            text="Label inbox mail with course + CI categories",
+            variable=labeler_var, font=ctk.CTkFont(size=13),
+        ).pack(anchor="w", padx=20, pady=(6, 0))
+        ctk.CTkLabel(
+            dialog,
+            text=("While the app is open, periodically scans the folder(s) "
+                  "below and tags each email with the student's course code "
+                  "and their CI's first name (from the CourseScan roster) — "
+                  "so anyone viewing the shared inbox sees whose student it "
+                  "is. Unknown senders get “Unidentified”; students with no "
+                  "assigned CI get “Unassigned”. Only ADDS categories — never "
+                  "moves, edits, or removes anything, and never touches "
+                  "teammates' personal subfolders. Mail from while the app "
+                  "was closed is caught up on the next launch."),
+            wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(0, 6))
+        lb_f_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        lb_f_row.pack(fill="x", padx=44, pady=(0, 2))
+        ctk.CTkLabel(lb_f_row, text="Folders (comma-separated):").pack(
+            side="left")
+        labeler_folders_var = ctk.StringVar(value=(
+            getattr(self.settings, "inbox_labeler_folders", "")
+            or ", ".join(_il.DEFAULT_FOLDERS)))
+        ctk.CTkEntry(lb_f_row, textvariable=labeler_folders_var,
+                     width=250).pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(
+            dialog,
+            text=("A mailbox name means its Inbox (top level only). Inbox "
+                  "subfolders work too — e.g. “UG Capstone IT, Students”."),
+            wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(0, 4))
+        lb_c_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        lb_c_row.pack(fill="x", padx=44, pady=(0, 2))
+        ctk.CTkLabel(lb_c_row, text="Courses to label:").pack(side="left")
+        labeler_courses_var = ctk.StringVar(value=(
+            getattr(self.settings, "inbox_labeler_courses", "")
+            or ", ".join(_il.DEFAULT_COURSES)))
+        ctk.CTkEntry(lb_c_row, textvariable=labeler_courses_var,
+                     width=320).pack(side="left", padx=(8, 0))
+        lb_i_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        lb_i_row.pack(fill="x", padx=44, pady=(4, 2))
+        ctk.CTkLabel(lb_i_row, text="Check every:").pack(side="left")
+        _LB_INTERVALS = {"2 min": 2, "5 min": 5, "10 min": 10,
+                         "15 min": 15, "30 min": 30}
+        _lb_cur = int(getattr(
+            self.settings, "inbox_labeler_interval_min", 5) or 5)
+        labeler_interval_var = ctk.StringVar(value=next(
+            (k for k, v in _LB_INTERVALS.items() if v == _lb_cur), "5 min"))
+        ctk.CTkComboBox(
+            lb_i_row, width=100, variable=labeler_interval_var,
+            state="readonly", values=list(_LB_INTERVALS.keys()),
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            lb_i_row, text="Label now", width=100,
+            command=lambda: self._labeler_run_now(),
+            **SECONDARY_BTN_KWARGS).pack(side="left", padx=(12, 0))
+        ctk.CTkButton(
+            lb_i_row, text="Refresh roster", width=110,
+            command=lambda: self._roster_scan_auto(),
+            **SECONDARY_BTN_KWARGS).pack(side="left", padx=(8, 0))
+        # Roster coverage + auto-detected CI names (read-only; the CI
+        # categories come from the roster's CourseMentor field).
+        try:
+            _lb_roster = _il.inbox_triage.load_roster(_il.ROSTER_PATH)
+            _lb_sum = _il.inbox_triage.roster_summary(
+                _lb_roster, _il.parse_items(
+                    labeler_courses_var.get(), _il.DEFAULT_COURSES))
+            _lb_courses_txt = ", ".join(
+                f"{c} ({n})" for c, n in sorted(_lb_sum["courses"].items()))
+            _lb_cis_txt = ", ".join(_lb_sum["cis"])
+            _lb_info = ("Roster covers: "
+                        + (_lb_courses_txt or "none of these courses")
+                        + ".  CI categories (detected automatically): "
+                        + (_lb_cis_txt or "none yet")
+                        + ". Courses missing here need a “coursescan: "
+                          "capture” + “coursescan: export” run on that "
+                          "course's view.")
+        except Exception:
+            _lb_info = ("No roster yet — run “coursescan: capture” then "
+                        "“coursescan: export” on a caseload view first. "
+                        "Until then everything labels as Unidentified.")
+        ctk.CTkLabel(
+            dialog, text=_lb_info, wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(2, 10))
+
         dialog = tab_security
         # Data-at-rest encryption: how often the app password is required.
         enc_active = (getattr(self, "_vault", None) is not None
@@ -19786,6 +19902,21 @@ class App:
                     self._vault.forget()
                 except Exception:
                     pass
+            # Inbox labeler: persist + nudge the polling thread so a freshly
+            # enabled/reconfigured labeler runs a pass right away.
+            was_labeling = getattr(self.settings, "inbox_labeler_enabled", False)
+            self.settings.inbox_labeler_enabled = bool(labeler_var.get())
+            self.settings.inbox_labeler_folders = labeler_folders_var.get().strip()
+            self.settings.inbox_labeler_courses = labeler_courses_var.get().strip()
+            self.settings.inbox_labeler_interval_min = _LB_INTERVALS.get(
+                labeler_interval_var.get().strip(), 5)
+            if self.settings.inbox_labeler_enabled and not was_labeling:
+                self._append_log("Inbox labeler: on — first pass starting…",
+                                 error=False)
+            if self.settings.inbox_labeler_enabled:
+                t = getattr(self, "_labeler_thread", None)
+                if t is not None:
+                    t.run_now()
             # Per-area font sizes already persist live via set_font_size.
             save_settings(self.settings)
             if qn_hk_changed:
@@ -22467,6 +22598,12 @@ class App:
                 self.caseload_window = None
         except Exception:
             pass
+        try:
+            t = getattr(self, "_labeler_thread", None)
+            if t is not None:
+                t.stop()   # daemon thread; no join needed — just unblock it
+        except Exception:
+            pass
         self.worker.shutdown()
         # Wait briefly for the worker to close Playwright cleanly, so the
         # process doesn't exit mid-teardown (which makes the driver print an
@@ -22870,6 +23007,62 @@ class App:
         ctk.CTkButton(frm, text="OK", width=90, command=_close).pack(anchor="e")
         dlg.protocol("WM_DELETE_WINDOW", _close)
         _fit_dialog_to_content(dlg, min_w=500)
+
+    # ---- Background inbox labeler (src/inbox_labeler.py) ----------------
+
+    def _start_inbox_labeler(self) -> None:
+        """Start the labeler's polling thread. Runs for the app's lifetime;
+        `_labeler_params` returning None (toggle off) makes it idle, so
+        Settings changes apply without a restart."""
+        if getattr(self, "_labeler_thread", None) is not None:
+            return
+        from src.inbox_labeler import LabelerThread
+
+        def on_log(msg: str, level: str) -> None:
+            # Called from the labeler thread — marshal onto the UI thread.
+            try:
+                self.root.after(0, lambda: self._append_log(
+                    msg, error=(True if level == "error" else False),
+                    success=(level == "ok")))
+            except Exception:
+                print(msg, file=sys.stderr)
+
+        self._labeler_thread = LabelerThread(self._labeler_params, on_log)
+        self._labeler_thread.start()
+
+    def _labeler_run_now(self) -> None:
+        """The Settings "Label now" button: wake the polling thread for an
+        immediate pass (uses the SAVED settings — unsaved dialog edits
+        don't apply until Save)."""
+        t = getattr(self, "_labeler_thread", None)
+        if t is None:
+            self._append_log("Inbox labeler isn't available in offline demo "
+                             "mode.", error=True)
+            return
+        if not getattr(self.settings, "inbox_labeler_enabled", False):
+            self._append_log("Inbox labeler is off — tick its checkbox and "
+                             "Save first.", error=False)
+            return
+        self._append_log("Inbox labeler: checking now…", error=False)
+        t.run_now()
+
+    def _labeler_params(self) -> Optional[dict]:
+        """run_pass kwargs from current settings, or None while disabled.
+        Read fresh each cycle so Settings edits take effect live."""
+        s = self.settings
+        if not getattr(s, "inbox_labeler_enabled", False):
+            return None
+        from src import inbox_labeler as il
+        return {
+            "folders": il.parse_items(
+                getattr(s, "inbox_labeler_folders", ""), il.DEFAULT_FOLDERS),
+            "courses": il.parse_items(
+                getattr(s, "inbox_labeler_courses", ""), il.DEFAULT_COURSES),
+            "lookback_days": max(
+                1, int(getattr(s, "inbox_labeler_lookback_days", 3) or 3)),
+            "interval_min": max(
+                1, int(getattr(s, "inbox_labeler_interval_min", 5) or 5)),
+        }
 
     def _maybe_outlook_classic_notice(self) -> None:
         """One-time startup heads-up when Outlook Classic isn't registered on
@@ -23525,17 +23718,105 @@ class App:
             return
         rows = [{k: v for k, v in r.items() if not isinstance(v, (dict, list))}
                 for r in grid.values()]
+        path = USER_CONFIG_DIR / "coursescan_roster.json"
+        # MERGE with the existing export instead of replacing it: this
+        # session's capture only holds the courses just scanned, and a
+        # C769-only rerun once wiped D502/C964 (and a partial scroll wiped
+        # half of C769) from the file. New rows win per (StudentID, Course);
+        # everything not re-seen is kept.
+        merged: dict = {}
         try:
-            path = USER_CONFIG_DIR / "coursescan_roster.json"
+            if path.exists():
+                with open(path, encoding="utf-8") as f:
+                    for r in _json.load(f):
+                        sid = str(r.get("StudentID") or "").strip()
+                        if sid:
+                            merged[(sid, str(r.get("CourseCode") or ""))] = r
+        except Exception:
+            pass
+        kept = len(merged)
+        for r in rows:
+            sid = str(r.get("StudentID") or "").strip()
+            if sid:
+                merged[(sid, str(r.get("CourseCode") or ""))] = r
+        out = list(merged.values())
+        try:
             with open(path, "w", encoding="utf-8") as f:
-                _json.dump(rows, f)
+                _json.dump(out, f)
         except Exception as ex:
             self._append_log(f"Export failed: {ex}", error=True)
             return
-        by_course = Counter(r.get("CourseCode") for r in rows)
-        self._append_log(f"Exported {len(rows)} grid rows → {path}")
+        by_course = Counter(r.get("CourseCode") for r in out)
+        self._append_log(
+            f"Exported {len(out)} roster rows → {path} "
+            f"({len(rows)} captured this session, merged over {kept} existing)")
         for c, n in by_course.most_common(8):
             self._append_log(f"  {c}: {n}")
+
+    def _maybe_auto_roster_refresh(self) -> None:
+        """Startup staleness check: when the labeler is on and the roster
+        export is older than inbox_labeler_roster_max_age_hours (default 24,
+        0 = off), kick off the automated roster scan. Keeps identification
+        current against WGU's rolling course starts without the user
+        remembering to run 'rosterscan:'."""
+        try:
+            if getattr(self, "_offline", False):
+                return
+            if not getattr(self.settings, "inbox_labeler_enabled", False):
+                return
+            max_age_h = int(getattr(
+                self.settings, "inbox_labeler_roster_max_age_hours", 24) or 0)
+            if max_age_h <= 0:
+                return
+            from src.inbox_labeler import ROSTER_PATH
+            if ROSTER_PATH.exists():
+                age_h = (time.time() - ROSTER_PATH.stat().st_mtime) / 3600
+                if age_h < max_age_h:
+                    return
+                self._append_log(
+                    f"Roster export is {age_h:.0f}h old — auto-refreshing "
+                    "(the browser will drive itself for a couple of "
+                    "minutes)…", error=False)
+            else:
+                self._append_log(
+                    "No roster export yet — capturing one now (the browser "
+                    "will drive itself for a couple of minutes)…",
+                    error=False)
+            self._roster_scan_auto()
+        except Exception:
+            pass
+
+    def _roster_scan_auto(self, courses: Optional[list] = None) -> None:
+        """Automated roster refresh — the hands-off replacement for the manual
+        'coursescan: capture' scroll. The worker switches the caseload list to
+        the Any Course view, auto-scrolls each course so every grid page
+        loads, restores the view, and the accumulated rows are exported to
+        coursescan_roster.json. The inbox labeler's self-correction then
+        upgrades any previously-Unidentified mail on its next pass."""
+        if getattr(self, "_offline", False):
+            self._append_log("Roster scan needs the browser (not available in "
+                             "offline demo).", error=True)
+            return
+        from src import inbox_labeler as il
+        if not courses:
+            courses = il.parse_items(
+                getattr(self.settings, "inbox_labeler_courses", ""),
+                il.DEFAULT_COURSES)
+        self._append_log(
+            "Roster scan: capturing " + ", ".join(courses)
+            + " from the Any Course view… (the browser will drive itself "
+            "for a minute)")
+
+        def on_done(ok: bool, msg: str) -> None:
+            def after() -> None:
+                if ok:
+                    self._append_log(f"Roster scan: {msg}")
+                    self._course_scan_export()
+                else:
+                    self._append_log(f"Roster scan failed: {msg}", error=True)
+            self.root.after(0, after)
+
+        self.worker.submit_refresh_roster(courses, on_done)
 
     def _course_scan_capture(self, seconds: int = 60) -> None:
         """Record SF data responses for `seconds` while you manually switch the

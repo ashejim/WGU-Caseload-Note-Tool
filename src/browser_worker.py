@@ -82,6 +82,16 @@ class BrowserWorker:
         # so we ACCUMULATE: {"by_key": {(StudentID, CourseCode): row}, "ts":
         # epoch} or None.
         self._grid_data: Optional[dict] = None
+        # Latest getCaseLoadMainGridData REQUEST (url + POST body), harvested
+        # always-on like the Aura creds — the template for the fast no-scroll
+        # roster refresh (replayed with `optionalCodes` = course code and the
+        # sacIdListToExclude paging loop). `_grid_request_roster` additionally
+        # keeps the last one seen DURING an any-course scan (its params show
+        # the true course-mode shape) — preferred as template when present,
+        # since the restore-reload overwrites `_grid_request` with the
+        # My-Students variant at scan end.
+        self._grid_request: Optional[dict] = None
+        self._grid_request_roster: Optional[dict] = None
         # Set while we temporarily switch the caseload list view to "Archive
         # (Last 30 Days)" to export it — suppresses grid-data capture so the
         # archive's (passed-student) rows don't pollute the My-Students grid
@@ -511,14 +521,31 @@ class BrowserWorker:
         fires from the worker thread."""
         self.q.put(("DOWNLOAD_OUTCOMES_ARCHIVE", save_path, on_done))
 
+    def submit_refresh_roster(
+        self,
+        courses: list,
+        on_done: Callable[[bool, str], None],
+    ) -> None:
+        """Automated whole-course roster capture (no manual scrolling):
+        switch the caseload list to the 'Any Course' view, load each course's
+        full list by auto-scrolling (the passive grid capture accumulates the
+        pages into the roster store), then restore the user's view. Read the
+        result via roster_rows_by_key(). `on_done(ok, msg)` fires from the
+        worker thread."""
+        self.q.put(("REFRESH_ROSTER", list(courses), on_done))
+
     def shutdown(self) -> None:
         self.q.put(self.SHUTDOWN)
 
     def _run(self) -> None:
         """Own the browser session(s). Normally one session for the whole app
         life; a RESTART_BROWSER command tears the context down and _session
-        returns True so we reopen a fresh one (hang recovery)."""
+        returns True so we reopen a fresh one (hang recovery). The same
+        reopen path runs automatically when the user closed the browser
+        window — the next command detects the dead context, relaunches, and
+        replays."""
         self._pending_restart_cb = None
+        self._replay_cmd = None
         first = True
         try:
             while True:
@@ -1060,6 +1087,13 @@ class BrowserWorker:
                 success, message = self._download_outcomes_archive(
                     ctx, save_path,
                 )
+            finally:
+                on_done(success, message)
+        elif cmd[0] == "REFRESH_ROSTER":
+            _, courses, on_done = cmd
+            success, message = False, ""
+            try:
+                success, message = self._refresh_roster(ctx, courses)
             finally:
                 on_done(success, message)
     def _try_match_or_navigate(self, target, query: str,
@@ -2443,6 +2477,21 @@ class BrowserWorker:
         # a recent one is valid for replaying saveNoteCmpValues via fetch().
         if method.upper() == "POST" and "/aura" in url:
             self._harvest_aura_creds(request)
+            # Keep the latest grid-data request as the fast-refresh template
+            # (see _grid_request / _grid_request_roster).
+            if "getCaseLoadMainGridData" in url:
+                try:
+                    gr = {
+                        "url": url,
+                        "post_data": request.post_data or "",
+                        "roster_mode": self._capture_to_roster,
+                        "ts": time.time(),
+                    }
+                    self._grid_request = gr
+                    if self._capture_to_roster:
+                        self._grid_request_roster = gr
+                except Exception:
+                    pass
         # Always-on: harvest the Mongoose API Bearer token (rides on every
         # sms-api.mongooseresearch.com request) — for replaying the text-send API.
         if "sms-api.mongooseresearch.com" in url:
@@ -4494,6 +4543,532 @@ class BrowserWorker:
                 self.on_status(f"  [archive] couldn't restore the view: {e}")
             self._suppress_grid_capture = False
         return True, f"archive saved to {Path(save_path).name}"
+
+    def _refresh_roster(self, ctx, courses: list) -> tuple[bool, str]:
+        """Automated whole-course roster capture. Tries the FAST path first —
+        replaying the getCaseLoadMainGridData Aura action directly (seconds,
+        no view switching, browser stays minimized) — and falls back to the
+        browser-driven Any-Course scroll when no request template has been
+        learned yet or the replay fails. The scroll path harvests + persists
+        the template, so the first successful scroll run teaches the fast
+        path for every run after."""
+        ok, msg = self._refresh_roster_fast(ctx, courses)
+        if ok:
+            return True, msg
+        self.on_status(f"  [roster] fast API path unavailable ({msg}) — "
+                       "falling back to the browser scan…")
+        with self._browser_restored_for_dom(ctx):
+            return self._refresh_roster_impl(ctx, courses)
+
+    _ROSTER_TEMPLATE_NAME = "roster_grid_template.json"
+
+    def _save_roster_template(self) -> None:
+        """Persist the harvested grid request (message + pageURI, NO
+        credentials — aura.token/context are re-harvested live each session)
+        so a cold-started future session can fast-refresh before its own
+        caseload load has harvested one. Prefers the any-course variant."""
+        import json as _json
+        tpl = self._grid_template()
+        if not tpl:
+            return
+        try:
+            from src.config import USER_CONFIG_DIR
+            with open(USER_CONFIG_DIR / self._ROSTER_TEMPLATE_NAME, "w",
+                      encoding="utf-8") as f:
+                _json.dump({"message": tpl["message"],
+                            "page_uri": tpl["page_uri"],
+                            "origin": tpl.get("origin", ""),
+                            "ts": time.time()}, f)
+        except Exception:
+            pass
+
+    def _grid_template(self):
+        """{"message", "page_uri"} for the fast refresh, from (in order) the
+        any-course harvest, the My-Students harvest (same schema — the course
+        selector is just blank), or the persisted file. None if none."""
+        import json as _json
+        from urllib.parse import parse_qs
+        for gr in (self._grid_request_roster, self._grid_request):
+            if not gr:
+                continue
+            try:
+                q = parse_qs(gr.get("post_data") or "")
+                message = (q.get("message") or [""])[0]
+                if message:
+                    origin = ""
+                    m = re.match(r"(https://[^/]+)", gr.get("url") or "")
+                    if m:
+                        origin = m.group(1)
+                    return {"message": message,
+                            "page_uri": (q.get("aura.pageURI") or [""])[0],
+                            "origin": origin}
+            except Exception:
+                continue
+        try:
+            from src.config import USER_CONFIG_DIR
+            with open(USER_CONFIG_DIR / self._ROSTER_TEMPLATE_NAME,
+                      encoding="utf-8") as f:
+                t = _json.load(f)
+            return t if t.get("message") else None
+        except Exception:
+            return None
+
+    def _refresh_roster_fast(self, ctx, courses: list) -> tuple[bool, str]:
+        """Replay getCaseLoadMainGridData per course — no browser driving.
+
+        Payload schema (decoded 2026-09-01 from a captured request):
+        params = {cmId: <mentor user id>, optionalCodes: "", smIDList: null,
+        sacIdListToExclude: [<StudentAcademicCourseId>...]}. The grid pages
+        by EXCLUSION — each round returns rows not in sacIdListToExclude —
+        and `optionalCodes` is the course selector (blank in My-Students
+        mode). So per course: set optionalCodes, loop request → collect the
+        rows' StudentAcademicCourseIds → exclude → repeat until empty.
+
+        Guards: if the returned rows aren't (mostly) the requested course,
+        the server ignored optionalCodes with cmId set — retried once with
+        cmId blanked; still wrong → (False, why) so the caller falls back to
+        the browser scan. Any structural surprise does the same."""
+        import json as _json
+
+        tpl = self._grid_template()
+        if tpl is None:
+            return False, "no grid request harvested yet (load the caseload "\
+                          "once first)"
+        target = self._active_page(ctx)
+        if target is None:
+            return False, "no active page"
+        origin = tpl.get("origin") or "https://srm.lightning.force.com"
+        # The fetch must run FROM a Salesforce page (same-origin /aura —
+        # a relative fetch from the SSO/blank page 404s; seen live). If the
+        # page isn't there yet, load the caseload page first — that also
+        # harvests fresh Aura creds.
+        def _on_sf() -> bool:
+            try:
+                return origin in (target.url or "")
+            except Exception:
+                return False
+        if not _on_sf():
+            try:
+                if CASELOAD_URL:
+                    target.goto(CASELOAD_URL)
+                    target.wait_for_timeout(2500)
+            except Exception:
+                pass
+            if not _on_sf():
+                return False, ("page isn't on Salesforce yet (SSO sign-in "
+                               "pending?)")
+        creds = self._aura_creds
+        if not creds:
+            return False, "no Aura credentials harvested yet"
+
+        try:
+            msg_obj = _json.loads(tpl["message"])
+            action = next(a for a in msg_obj.get("actions", [])
+                          if "getCaseLoadMainGridData"
+                          in str(a.get("descriptor", "")))
+            params = action.get("params") or {}
+        except Exception as e:
+            return False, f"template message unparsable: {e}"
+        if "optionalCodes" not in params or "sacIdListToExclude" not in params:
+            return False, ("params lack optionalCodes/sacIdListToExclude — "
+                           "schema changed; see roster_grid_request_probe.txt")
+
+        def _replay():
+            js = """async ([url, message, ctxs, token, pageUri]) => {
+                const body = new URLSearchParams();
+                body.set('message', message);
+                body.set('aura.context', ctxs);
+                body.set('aura.pageURI', pageUri);
+                body.set('aura.token', token);
+                const resp = await fetch(url, {
+                    method: 'POST', credentials: 'include',
+                    headers: {'Content-Type':
+                              'application/x-www-form-urlencoded;charset=UTF-8'},
+                    body: body.toString(),
+                });
+                return await resp.text();
+            }"""
+            aura_url = (origin
+                        + "/aura?other.MentorForce.getCaseLoadMainGridData=1")
+            body = target.evaluate(js, [
+                aura_url, _json.dumps(msg_obj), creds["context"],
+                creds["token"],
+                tpl.get("page_uri") or "/lightning/n/Caseload_App_Page"])
+            i = body.find("{")
+            env = _json.loads(body[i:]) if i >= 0 else {}
+            for a in env.get("actions") or []:
+                if a.get("state") == "SUCCESS" \
+                        and isinstance(a.get("returnValue"), list):
+                    return a["returnValue"]
+            raise RuntimeError("no SUCCESS action in reply: " + body[:200])
+
+        def _fetch_course(code: str) -> tuple[list, str]:
+            """All rows for one course via the exclusion-paging loop.
+            Returns (rows, error)."""
+            all_rows, seen = [], set()
+            exclude: list = []   # start clean — the template's list is stale
+            for _ in range(40):   # ≤40 rounds ≈ 4000+ rows
+                params["sacIdListToExclude"] = exclude
+                try:
+                    rows = _replay()
+                except Exception as e:
+                    return all_rows, str(e)[:150]
+                if not rows:
+                    return all_rows, ""
+                new_sacs = [str(r.get("StudentAcademicCourseId") or "")
+                            for r in rows]
+                new_sacs = [s for s in new_sacs if s and s not in seen]
+                if not new_sacs:
+                    # server ignored the exclude list — stop, keep round 1
+                    return all_rows or rows, ""
+                seen.update(new_sacs)
+                exclude.extend(new_sacs)
+                all_rows.extend(rows)
+            return all_rows, ""
+
+        captured, misses = [], []
+        cm_id_orig = params.get("cmId")
+        for course in courses:
+            code = str(course).strip()
+            if not code:
+                continue
+            params["optionalCodes"] = code
+            params["cmId"] = cm_id_orig
+            rows, err = _fetch_course(code)
+
+            def _course_share(rs):
+                if not rs:
+                    return 0.0
+                hits = sum(1 for r in rs if str(
+                    r.get("CourseCode") or "").strip().upper() == code.upper())
+                return hits / len(rs)
+
+            if rows and _course_share(rows) < 0.9:
+                # got the My-Students mix instead — retry without cmId
+                params["cmId"] = ""
+                rows2, err2 = _fetch_course(code)
+                if rows2 and _course_share(rows2) >= 0.9:
+                    rows, err = rows2, err2
+                else:
+                    misses.append(f"{code}: server returned the caseload "
+                                  "mix, not the course")
+                    continue
+            if err and not rows:
+                misses.append(f"{code}: {err}")
+                continue
+            if not rows:
+                misses.append(f"{code}: 0 rows")
+                continue
+            self._merge_roster_rows(rows)
+            self.on_status(f"  [roster] {code}: {len(rows)} rows (API)")
+            captured.append(code)
+        if not captured:
+            return False, "; ".join(misses) or "no rows from the API"
+        n = len(((self._roster_data or {}).get("by_key")) or {})
+        msg = (f"captured {n} roster rows via the API (no browser driving) "
+               f"across {', '.join(captured)}")
+        if misses:
+            msg += "  (skipped: " + "; ".join(misses) + ")"
+        return True, msg
+
+    def _merge_roster_rows(self, rows: list) -> None:
+        """Merge grid rows into the roster store — same keying as the
+        passive capture (_capture_grid_data roster mode)."""
+        store = self._roster_data or {"by_key": {}, "ts": 0.0}
+        for row in rows:
+            try:
+                sid = str(row.get("StudentID") or "").strip()
+                if not sid:
+                    continue
+                course = str(row.get("CourseCode") or "").strip()
+                store["by_key"][(sid, course)] = row
+            except Exception:
+                continue
+        store["ts"] = time.time()
+        self._roster_data = store
+
+    def _refresh_roster_impl(self, ctx, courses: list) -> tuple[bool, str]:
+        """Switch the caseload page's 'View By' RADIO to 'Any Course', then
+        for each course: pick it in the course combobox, auto-scroll the list
+        so Lightning fetches every ~100-row grid page, and let the always-on
+        getCaseLoadMainGridData capture accumulate those pages into the
+        ROSTER store (_capture_to_roster keeps other CIs' students out of the
+        My-Students caseload grid). Restores 'My Students' either way.
+
+        DOM (confirmed from resources/Caseload.html): 'View By:' is a group
+        of aura radios — input[type=radio] values 'My Students' / 'Any
+        Course' / 'Any Student'; the pickers beside it ('View As:' mentor,
+        and the course picker in Any-Course mode) are LWC lightning-combobox
+        widgets: button[role="combobox"] opening a [role="option"] listbox.
+        The course combobox is found by probing each visible combobox for an
+        option starting with the course code (the mentor combobox holds
+        names, so it never matches)."""
+        target, table = self._open_caseload_table(ctx)
+        if table is None:
+            return False, "caseload table didn't load"
+
+        def _click_radio(value: str) -> bool:
+            try:
+                r = target.locator(
+                    f'input[type="radio"][value="{value}"]').first
+                if r.count() == 0:
+                    return False
+                try:
+                    r.check(force=True)
+                except Exception:
+                    # Aura radios sometimes swallow check(); click the label.
+                    target.locator(
+                        f'label:has(input[type="radio"][value="{value}"])'
+                    ).first.click()
+                return True
+            except Exception:
+                return False
+
+        if target.locator(
+                'input[type="radio"][value="Any Course"]').count() == 0:
+            return False, ("no 'Any Course' radio (View By) on the caseload "
+                           "page — is the Caseload list open?")
+
+        captured_courses, misses = [], []
+        self._capture_to_roster = True
+        try:
+            if not _click_radio("Any Course"):
+                return False, "couldn't select the 'Any Course' radio"
+            # Selecting 'Any Course' pops a course-search dialog (type the
+            # code → Enter → click the result row). It's already open for
+            # the first course; re-toggling the radios reopens it for each
+            # subsequent one.
+            target.wait_for_timeout(900)
+
+            for idx, course in enumerate(courses):
+                code = str(course).strip()
+                if not code:
+                    continue
+                if idx > 0:
+                    _click_radio("My Students")
+                    target.wait_for_timeout(700)
+                    _click_radio("Any Course")
+                    target.wait_for_timeout(900)
+                ok, err = self._pick_course_via_popup(target, code)
+                if not ok:
+                    misses.append(f"{code}: {err}")
+                    continue
+                try:
+                    target.wait_for_timeout(900)
+                    _wait_grid_settled(target, 6000)
+                except Exception:
+                    pass
+                # Wait for the first rows on the EXISTING handle, and only
+                # re-acquire if they never show (a detached handle after the
+                # view re-render). Order matters: re-acquiring first burned
+                # a 20s "caseload table didn't load" timeout per course live
+                # even though the handle was fine — rows just hadn't
+                # rendered yet.
+                def _rows_appear(t, checks: int) -> bool:
+                    for _ in range(checks):
+                        try:
+                            if t.locator("tr").count() > 1:
+                                return True
+                        except Exception:
+                            pass
+                        try:
+                            target.wait_for_timeout(500)
+                        except Exception:
+                            return False
+                    return False
+
+                if not _rows_appear(table, 16):   # ~8s on the old handle
+                    try:
+                        _t2, t2 = self._open_caseload_table(ctx)
+                        if t2 is not None:
+                            table = t2
+                    except Exception:
+                        pass
+                    _rows_appear(table, 8)   # brief settle on the new one
+                # Auto-scroll until the row count is stable — each lazy-load
+                # chunk fires a grid page the passive capture accumulates.
+                last, stable = -1, 0
+                for _ in range(300):
+                    rows = table.locator("tr")
+                    try:
+                        count = rows.count()
+                    except Exception:
+                        break
+                    if count == last:
+                        stable += 1
+                        if stable >= 3:
+                            break
+                    else:
+                        stable = 0
+                    last = count
+                    self._scroll_datatable_to_bottom(table)
+                    try:
+                        rows.nth(count - 1).scroll_into_view_if_needed(
+                            timeout=2000)
+                    except Exception:
+                        pass
+                    try:
+                        target.wait_for_timeout(400)
+                    except Exception:
+                        pass
+                self.on_status(f"  [roster] {code}: {max(last - 1, 0)} rows "
+                               "loaded")
+                captured_courses.append(code)
+        finally:
+            self._capture_to_roster = False
+            # Restore by RELOADING the caseload page outright. Clicking the
+            # 'My Students' radio back looked successful live but left the
+            # page half-broken (empty grid, no row-filter, every later
+            # command timing out on "caseload table didn't load") — a fresh
+            # navigation is the only restore that guarantees the My-Students
+            # grid + its filter are back. It also re-fires the grid feed, so
+            # the caseload capture refreshes for free.
+            try:
+                page = self._active_page(ctx)
+                if page is not None and CASELOAD_URL:
+                    page.goto(CASELOAD_URL)
+                    page.wait_for_timeout(1500)
+                    _wait_grid_settled(page, 8000)
+                else:
+                    self.on_status("  [roster] couldn't reload the caseload "
+                                   "page — click ↻ Caseload to restore it")
+            except Exception as e:
+                self.on_status(f"  [roster] caseload reload failed: {e} — "
+                               "click ↻ Caseload to restore it")
+
+        # Dump the harvested grid REQUEST for the future no-scroll refresh
+        # (contains the aura token — the probe file is gitignored).
+        if self._grid_request:
+            try:
+                from src.config import USER_CONFIG_DIR
+                with open(USER_CONFIG_DIR / "roster_grid_request_probe.txt",
+                          "w", encoding="utf-8") as f:
+                    f.write(self._grid_request["url"] + "\n\n")
+                    f.write(self._grid_request["post_data"])
+            except Exception:
+                pass
+        # Teach the fast API path: persist the any-course request template
+        # (credential-free) so the NEXT refresh can skip the browser scan.
+        self._save_roster_template()
+
+        n = len(((self._roster_data or {}).get("by_key")) or {})
+        if not captured_courses:
+            return False, ("no course loaded — " + "; ".join(misses)
+                           if misses else "no course loaded")
+        msg = (f"captured {n} roster rows across "
+               f"{', '.join(captured_courses)}")
+        if misses:
+            msg += "  (skipped: " + "; ".join(misses) + ")"
+        return True, msg
+
+    def _pick_course_via_popup(self, target, code: str) -> tuple[bool, str]:
+        """Drive the course-search popup that opens when 'View By: Any
+        Course' is selected: type the course code into its search field,
+        press Enter, then click the result row for that course (the user's
+        manual flow). The popup's DOM was never captured in a snapshot, so
+        the selectors are layered fallbacks — any failure dumps the live
+        popup DOM to roster_popup_probe.txt so the next fix is exact."""
+        code = code.strip()
+        # 1. The popup's search input: prefer one inside a modal/dialog
+        # container; fall back to any visible text/search input that isn't
+        # the caseload grid's own "Search All Rows..." filter.
+        inp = None
+        scope = None
+        for con_sel in ('.slds-modal', '[role="dialog"]', '.uiModal',
+                        '.uiPanel', '.forceModal'):
+            cons = target.locator(con_sel)
+            try:
+                n = min(cons.count(), 6)
+            except Exception:
+                continue
+            for i in range(n):
+                con = cons.nth(i)
+                try:
+                    if not con.is_visible():
+                        continue
+                    f = con.locator(
+                        'input[type="search"], input[type="text"]').first
+                    if f.count() > 0 and f.is_visible():
+                        inp, scope = f, con
+                        break
+                except Exception:
+                    continue
+            if inp is not None:
+                break
+        if inp is None:
+            try:
+                fields = target.locator(
+                    'input[type="search"], input[type="text"]')
+                for i in range(min(fields.count(), 12)):
+                    f = fields.nth(i)
+                    try:
+                        if not f.is_visible():
+                            continue
+                        ph = f.get_attribute("placeholder") or ""
+                        if "Search All Rows" in ph:
+                            continue
+                        inp = f
+                        break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        if inp is None:
+            self._dump_roster_popup_probe(target)
+            return False, ("course-search popup not found "
+                           "(DOM → roster_popup_probe.txt)")
+
+        try:
+            inp.click()
+            inp.fill(code)
+            inp.press("Enter")
+        except Exception as e:
+            return False, f"couldn't type into the course search: {e}"
+
+        # 2. Wait for the search results, then click the course's row.
+        where = scope if scope is not None else target
+        row_sels = (f'tr:has-text("{code}")',
+                    f'li:has-text("{code}")',
+                    f'[role="option"]:has-text("{code}")',
+                    f'lightning-base-combobox-item:has-text("{code}")',
+                    f'td:has-text("{code}")',
+                    f'a:has-text("{code}")')
+        for _ in range(16):   # up to ~8s for the server-side search
+            for rs in row_sels:
+                try:
+                    r = where.locator(rs).first
+                    if r.count() > 0 and r.is_visible():
+                        r.click()
+                        return True, ""
+                except Exception:
+                    continue
+            try:
+                target.wait_for_timeout(500)
+            except Exception:
+                break
+        self._dump_roster_popup_probe(target)
+        return False, (f"typed '{code}' but no result row appeared "
+                       "(DOM → roster_popup_probe.txt)")
+
+    def _dump_roster_popup_probe(self, target) -> None:
+        """Write the visible modal/dialog DOM to roster_popup_probe.txt so a
+        failed popup interaction tells us the real structure (the popup was
+        never captured in the saved Caseload.html snapshot)."""
+        from src.config import USER_CONFIG_DIR
+        try:
+            html_dump = target.evaluate(
+                "() => [...document.querySelectorAll("
+                "'.slds-modal, [role=\"dialog\"], .uiModal, .uiPanel, "
+                ".forceModal, .panel')]"
+                ".filter(e => e.offsetParent !== null)"
+                ".map(e => e.outerHTML.slice(0, 30000))"
+                ".join('\\n\\n========\\n\\n')") or "(no visible dialogs)"
+            path = USER_CONFIG_DIR / "roster_popup_probe.txt"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html_dump)
+            self.on_status(f"  [roster] popup DOM dumped → {path.name}")
+        except Exception:
+            pass
 
     def _scroll_datatable_to_bottom(self, table) -> None:
         """Force the caseload datatable's scroll CONTAINER to its bottom to

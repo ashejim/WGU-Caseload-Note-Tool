@@ -47,6 +47,10 @@ gridbuild_report.txt
 gridschema_report.txt
 coursescan_report.txt
 coursescan_roster.json
+# Inbox-labeler decision log + seen-state (scripts/label_inbox.py) —
+# sender names/emails/subjects = student PII.
+inbox_label_log.jsonl
+inbox_label_state.json
 
 # Cached caseload export — student PII, FERPA, never commit.
 caseload.csv
@@ -129,6 +133,12 @@ flup_save_probe.txt
 text_send_probe.txt
 mongoose_api_probe.txt
 oc_probe*.txt
+roster_popup_probe.txt
+# Harvested grid request (contains live aura.token — session credential).
+roster_grid_request_probe.txt
+# Learned credential-free grid-request template for the fast roster refresh
+# (params carry mentor/user ids — local only).
+roster_grid_template.json
 
 # Fresh-install demo sandbox (isolated config for onboarding troubleshooting)
 _fresh_demo/
